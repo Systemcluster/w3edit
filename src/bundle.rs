@@ -3,7 +3,7 @@ use std::ffi::{CStr, CString};
 use std::fmt::Debug;
 use std::io::Read;
 
-use log::{debug, info};
+use log::debug;
 
 use crate::errors::*;
 use crate::util::*;
@@ -125,11 +125,10 @@ impl<'a> BundleItem<'a> {
                 Ok(data)
             },
             BundleCompression::Snappy => {
-                let mut decoder = snap::read::FrameDecoder::new(
-                    &self.data[self.offset as usize..(self.offset + self.zsize) as usize],
-                );
-                let mut data = Vec::with_capacity(self.size as usize);
-                decoder.read_to_end(&mut data).map_err(|e| ReadError(e.to_string()))?;
+                let raw = &self.data[self.offset as usize..(self.offset + self.zsize) as usize];
+                let data = snap::raw::Decoder::new()
+                    .decompress_vec(raw)
+                    .map_err(|e| ReadError(e.to_string()))?;
                 Ok(data)
             },
             BundleCompression::Doboz => Err(BundleError::UnsupportedCompression("Doboz".to_string())),

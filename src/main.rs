@@ -8,8 +8,6 @@ mod util;
 
 
 fn main() {
-    use std::path::Path;
-
     use bundle::*;
     use metadata::*;
 
@@ -34,6 +32,6 @@ fn main() {
     // }
 
     let data = std::fs::read("test/assets/modnmm/metadata.store").unwrap();
-    let metadata = Metadata::parse(data).unwrap();
+    let metadata = Metadata::parse(&data).unwrap();
     debug!("{:#?}", metadata);
 }

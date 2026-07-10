@@ -1,5 +1,4 @@
-use std::borrow::Cow;
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::fmt::Debug;
 use std::mem::size_of;
 
@@ -7,7 +6,6 @@ use log::{debug, trace};
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 use crate::errors::*;
-use crate::hash::fnv64;
 use crate::util::{read, read_vlq_i32};
 
 
@@ -54,7 +52,7 @@ pub struct MetadataDirectoryInitInfo {
 
 #[repr(C)]
 #[derive(FromZeroes, FromBytes, AsBytes, Debug, Clone, Copy)]
-pub struct MetadatFileInitInfo {
+pub struct MetadataFileInitInfo {
     pub(crate) file_id:                  i32,
     pub(crate) directory_id:             i32,
     pub(crate) string_table_name_offset: i32,
@@ -73,10 +71,15 @@ pub struct DynamicArray<T: Debug + Clone + FromBytes + AsBytes> {
     pub(crate) length:  usize,
 }
 impl<T: Debug + Clone + FromBytes + AsBytes> DynamicArray<T> {
-    pub fn parse<R: AsRef<[u8]>>(data: R, start: usize) -> Result<Self, MetadataError> {
-        let data = data.as_ref();
-        let (count, length) = read_vlq_i32(&data[start..])?;
-        let mut position = start + length;
+    pub fn parse(data: &[u8], start: usize) -> Result<Self, MetadataError> {
+        let (count, vlq_len) = read_vlq_i32(&data[start..])?;
+        if count < 0 {
+            return Err(MetadataError::InvalidBytes(ReadError(format!(
+                "negative array count: {}",
+                count
+            ))));
+        }
+        let mut position = start + vlq_len;
         let mut entries = Vec::with_capacity(count as usize);
         for _ in 0..count {
             entries.push(read::<T>(&data[position..position + size_of::<T>()])?);
@@ -89,21 +92,39 @@ impl<T: Debug + Clone + FromBytes + AsBytes> DynamicArray<T> {
     }
 }
 
-#[derive(Clone)]
-pub struct Metadata<'a> {
-    pub(crate) data: Cow<'a, [u8]>,
+#[derive(Debug, Clone)]
+pub struct Metadata {
+    pub version:            u32,
+    pub max_size_in_bundle: u32,
+    pub max_size_in_memory: u32,
+    pub string_table:       Vec<u8>,
+    pub file_infos:         Vec<(CString, MetadataFileInfo)>,
+    pub entry_infos:        Vec<MetadataFileEntryInfo>,
+    pub bundle_infos:       Vec<MetadataBundleInfo>,
+    pub buffers:            Vec<u32>,
+    pub dir_init_infos:     Vec<MetadataDirectoryInitInfo>,
+    pub file_init_infos:    Vec<MetadataFileInitInfo>,
+    pub hashes:             Vec<MetadataHash>,
 }
 
-impl<'a> Metadata<'a> {
-    pub fn new() -> Metadata<'static> {
+impl Metadata {
+    pub fn new() -> Self {
         Metadata {
-            data: Cow::Owned(Vec::new()),
+            version:            0,
+            max_size_in_bundle: 0,
+            max_size_in_memory: 0,
+            string_table:       Vec::new(),
+            file_infos:         Vec::new(),
+            entry_infos:        Vec::new(),
+            bundle_infos:       Vec::new(),
+            buffers:            Vec::new(),
+            dir_init_infos:     Vec::new(),
+            file_init_infos:    Vec::new(),
+            hashes:             Vec::new(),
         }
     }
 
-    pub fn parse<R: Into<Cow<'a, [u8]>>>(data: R) -> Result<Self, MetadataError> {
-        let data = data.into();
-
+    pub fn parse(data: &[u8]) -> Result<Self, MetadataError> {
         let magic = read::<[u8; 4]>(&data[0..4])?;
         trace!("magic: {:?}", magic);
         if magic != *b"\x03VTM" {
@@ -116,81 +137,94 @@ impl<'a> Metadata<'a> {
         let version = read::<u32>(&data[4..8])?;
         trace!("version: {:?}", version);
         let max_size_in_bundle = read::<u32>(&data[8..12])?;
-        trace!("max_size: {:?}", max_size_in_bundle);
+        trace!("max_size_in_bundle: {:?}", max_size_in_bundle);
         let max_size_in_memory = read::<u32>(&data[12..16])?;
         trace!("max_size_in_memory: {:?}", max_size_in_memory);
-        let (string_table_size, length) = read_vlq_i32(&data[16..20])?;
+        let (string_table_size, vlq_len) = read_vlq_i32(&data[16..])?;
         trace!("string_table_size: {:?}", string_table_size);
+        if string_table_size < 0 {
+            return Err(MetadataError::InvalidBytes(ReadError(format!(
+                "negative string table size: {}",
+                string_table_size
+            ))));
+        }
 
-        let mut position = 16 + length;
+        let mut position = 16 + vlq_len;
 
-        let string_table = data[position..=position + string_table_size as usize].to_vec();
-        trace!("string_table: {:?}", &string_table[string_table.len() - 5..]);
+        let string_table = data[position..position + string_table_size as usize].to_vec();
         position += string_table_size as usize;
 
         trace!("position after string table: {:#x?}", position);
 
-        let file_infos = DynamicArray::<MetadataFileInfo>::parse(data.clone(), position)?;
-        position += file_infos.length;
+        let file_infos_raw = DynamicArray::<MetadataFileInfo>::parse(data, position)?;
+        position += file_infos_raw.length;
 
-        let mut parsed_file_infos = Vec::with_capacity(file_infos.entries.len());
-        for file_info in &file_infos.entries {
-            let string_table_name = &string_table[file_info.string_table_name_offset as usize..];
-            let string_table_name = CStr::from_bytes_until_nul(string_table_name)
+        let mut file_infos = Vec::with_capacity(file_infos_raw.entries.len());
+        for file_info in &file_infos_raw.entries {
+            let name = CStr::from_bytes_until_nul(&string_table[file_info.string_table_name_offset as usize..])
                 .map_err(|e| ReadError(e.to_string()))?
                 .to_owned();
-            parsed_file_infos.push((string_table_name, file_info));
+            file_infos.push((name, *file_info));
         }
-        trace!(
-            "parsed_file_info ({}): {:#?}",
-            parsed_file_infos.len(),
-            parsed_file_infos
-        );
+        trace!("file_infos ({}): {:#?}", file_infos.len(), file_infos);
 
-        let entry_infos = DynamicArray::<MetadataFileEntryInfo>::parse(data.clone(), position)?;
-        trace!("entry_info: ({}): {:#?}", entry_infos.entries.len(), entry_infos);
+        let entry_infos = DynamicArray::<MetadataFileEntryInfo>::parse(data, position)?;
+        trace!("entry_infos ({}): {:#?}", entry_infos.entries.len(), entry_infos);
         position += entry_infos.length;
 
-        let bundle_infos = DynamicArray::<MetadataBundleInfo>::parse(data.clone(), position)?;
-        trace!("bundle_info: ({}): {:#?}", bundle_infos.entries.len(), bundle_infos);
+        let bundle_infos = DynamicArray::<MetadataBundleInfo>::parse(data, position)?;
+        trace!("bundle_infos ({}): {:#?}", bundle_infos.entries.len(), bundle_infos);
         position += bundle_infos.length;
 
-        let (buffers_count, length) = read_vlq_i32(&data[position..position + 4])?;
-        let mut position = position + length;
+        let (buffers_count, vlq_len) = read_vlq_i32(&data[position..])?;
+        if buffers_count < 0 {
+            return Err(MetadataError::InvalidBytes(ReadError(format!(
+                "negative buffer count: {}",
+                buffers_count
+            ))));
+        }
+        position += vlq_len;
         let mut buffers = Vec::with_capacity(buffers_count as usize);
         for _ in 0..buffers_count {
             buffers.push(read::<u32>(&data[position..position + 4])?);
             position += 4;
         }
-        trace!("buffers: ({}): {:#?}", buffers.len(), buffers);
+        trace!("buffers ({}): {:#?}", buffers.len(), buffers);
 
-        let dir_init_infos = DynamicArray::<MetadataDirectoryInitInfo>::parse(data.clone(), position)?;
+        let dir_init_infos = DynamicArray::<MetadataDirectoryInitInfo>::parse(data, position)?;
         trace!(
-            "dir_init_info: ({}): {:#?}",
+            "dir_init_infos ({}): {:#?}",
             dir_init_infos.entries.len(),
             dir_init_infos
         );
         position += dir_init_infos.length;
 
-        let file_init_infos = DynamicArray::<MetadatFileInitInfo>::parse(data.clone(), position)?;
+        let file_init_infos = DynamicArray::<MetadataFileInitInfo>::parse(data, position)?;
         trace!(
-            "file_init_info: ({}): {:#?}",
+            "file_init_infos ({}): {:#?}",
             file_init_infos.entries.len(),
             file_init_infos
         );
         position += file_init_infos.length;
 
-        let hashes = DynamicArray::<MetadataHash>::parse(data.clone(), position)?;
-        trace!("hashes: ({}): {:#X?}", hashes.entries.len(), hashes);
+        let hashes = DynamicArray::<MetadataHash>::parse(data, position)?;
+        trace!("hashes ({}): {:#X?}", hashes.entries.len(), hashes);
         position += hashes.length;
 
         debug!("metadata: read {} out of {} bytes", position, data.len());
 
-        trace!("{:?}", parsed_file_infos[4].0);
-        trace!("{:#X?}", fnv64(parsed_file_infos[4].0.as_bytes()));
-
         Ok(Metadata {
-            data,
+            version,
+            max_size_in_bundle,
+            max_size_in_memory,
+            string_table,
+            file_infos,
+            entry_infos: entry_infos.entries,
+            bundle_infos: bundle_infos.entries,
+            buffers,
+            dir_init_infos: dir_init_infos.entries,
+            file_init_infos: file_init_infos.entries,
+            hashes: hashes.entries,
         })
     }
 }
