@@ -1,0 +1,75 @@
+[package]
+
+authors = ["Christian Sdunek <me@systemcluster.me>"]
+categories = ["compression", "filesystem", "command-line-utilities"]
+keywords = ["witcher-3", "modding", "games"]
+description = "Utility for packing, unpacking and analyzing The Witcher 3 bundle files"
+edition = "2021"
+include = [
+  "Cargo.toml",
+  "src/**/*",
+  "LICENSE",
+]
+license = "BSD-2-Clause"
+name = "w3edit"
+readme = "README.md"
+repository = "https://github.com/Systemcluster/w3edit"
+version = "0.0.1"
+
+[[bin]]
+
+name = "w3edit"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[profile.dev]
+
+debug = 1
+debug-assertions = true
+incremental = true
+lto = "off"
+opt-level = 0
+panic = "unwind"
+
+[profile.dev.package."*"]
+
+inherits = "dev"
+opt-level = 2
+
+[profile.release]
+
+codegen-units = 1
+debug = false
+debug-assertions = false
+incremental = false
+lto = "fat"
+opt-level = 's'
+panic = "abort"
+strip = "none"
+
+[dependencies]
+
+log = { version = "0.4" }
+thiserror = { version = "1.0" }
+jwalk = { version = "0.8" }
+flate2 = { version = "1.0" }
+lz4 = { version = "1.25" }
+snap = { version = "1.1" }
+memmap2 = { version = "0.9" }
+zerocopy = { version = "0.7", features = ["derive"] }
+
+clap = { version = "4.5", features = ["std", "color", "suggestions", "derive", "unicode", "wrap_help"], optional = true }
+color-backtrace = { version = "0.6", optional = true }
+console = { version = "0.15", optional = true }
+env_logger = { version = "0.11", optional = true }
+indicatif = { version = "0.17", optional = true }
+
+[features]
+
+default = ["cli"]
+cli = ["dep:clap", "dep:color-backtrace", "dep:console", "dep:env_logger", "dep:indicatif"]
+
+[package.metadata.docs.rs]
+
+rustdoc-args = ["--cfg", "docsrs"]
+all-features = true
