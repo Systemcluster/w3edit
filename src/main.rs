@@ -1,16 +1,10 @@
 use log::debug;
 
-mod bundle;
-mod errors;
-mod hash;
-mod metadata;
-mod util;
+use w3edit::bundle::Bundle;
+use w3edit::metadata::Metadata;
 
 
 fn main() {
-    use bundle::*;
-    use metadata::*;
-
     env_logger::builder()
         .is_test(false)
         .filter_level(log::LevelFilter::Trace)
@@ -25,10 +19,10 @@ fn main() {
     let bundle = Bundle::parse(data).unwrap();
     debug!("{:#?}", bundle);
 
-    // for item in &bundle.items {
-    //     let path = Path::new("test/assets/unpack").join(item.name.to_str().unwrap());
+    // for item in bundle.items() {
+    //     let path = Path::new("test/assets/unpack").join(item.name().to_str().unwrap());
     //     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    //     std::fs::write(&path, item.data().unwrap()).unwrap();
+    //     std::fs::write(&path, item.decompressed().unwrap()).unwrap();
     // }
 
     let data = std::fs::read("test/assets/modnmm/metadata.store").unwrap();

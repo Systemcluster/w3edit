@@ -16,6 +16,11 @@ readme = "README.md"
 repository = "https://github.com/Systemcluster/w3edit"
 version = "0.0.1"
 
+[lib]
+
+name = "w3edit"
+path = "src/lib.rs"
+
 [[bin]]
 
 name = "w3edit"
@@ -50,19 +55,17 @@ strip = "none"
 [dependencies]
 
 log = { version = "0.4" }
-thiserror = { version = "1.0" }
-jwalk = { version = "0.8" }
-flate2 = { version = "1.0" }
-lz4 = { version = "1.25" }
+thiserror = { version = "2.0" }
+flate2 = { version = "1.1" }
+lz4 = { version = "1.28" }
 snap = { version = "1.1" }
-memmap2 = { version = "0.9" }
-zerocopy = { version = "0.7", features = ["derive"] }
+zerocopy = { version = "0.8", features = ["derive"] }
 
-clap = { version = "4.5", features = ["std", "color", "suggestions", "derive", "unicode", "wrap_help"], optional = true }
-color-backtrace = { version = "0.6", optional = true }
-console = { version = "0.15", optional = true }
+clap = { version = "4.6", features = ["std", "color", "suggestions", "derive", "unicode", "wrap_help"], optional = true }
+color-backtrace = { version = "0.7", optional = true }
+console = { version = "0.16", optional = true }
 env_logger = { version = "0.11", optional = true }
-indicatif = { version = "0.17", optional = true }
+indicatif = { version = "0.18", optional = true }
 
 [features]
 

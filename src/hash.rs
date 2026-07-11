@@ -1,3 +1,8 @@
+//! CRC64 and FNV64 hash implementations reserved for future `texture.cache`
+//! support (see `w3edit-formats.md`). Currently unused elsewhere in the crate.
+
+#![allow(dead_code)]
+
 const CRC64_TABLE: [u64; 256] = [
     0x0000000000000000,
     0xb32e4cbe03a75f6f,

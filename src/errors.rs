@@ -15,6 +15,12 @@ pub enum BundleError {
 
 #[derive(Error, Debug, Clone)]
 pub enum MetadataError {
-    #[error("invalid bundle: {0}")]
+    #[error("invalid metadata: {0}")]
+    InvalidBytes(#[from] ReadError),
+}
+
+#[derive(Error, Debug, Clone)]
+pub enum TextureCacheError {
+    #[error("invalid texture cache: {0}")]
     InvalidBytes(#[from] ReadError),
 }
