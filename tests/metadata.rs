@@ -6,6 +6,86 @@ use std::path::PathBuf;
 
 use w3edit::metadata::Metadata;
 
+#[test]
+fn create_metadata_for_both_formats() {
+    use w3edit::{Bundle, BundleCompression, BundleFormat, BundleItem};
+    for format in [BundleFormat::Legacy, BundleFormat::Remastered] {
+        let bundle = Bundle::from_items(format, vec![
+            BundleItem::new(c"test\\file.bin".into(), b"payload", BundleCompression::Zlib).unwrap(),
+        ]);
+        let metadata = Metadata::from_bundles(format, &[(c"blob0.bundle", &bundle)]).unwrap();
+        let parsed = Metadata::parse(&metadata.write()).unwrap();
+        assert_eq!(parsed.version, if format == BundleFormat::Legacy { 6 } else { 7 });
+        assert_eq!(parsed.entry_infos[1].offset_in_bundle, bundle.compute_offsets_u64()[0]);
+        assert_eq!(parsed.file_path(1), Some(c"test\\file.bin"));
+        assert_eq!(parsed.bundle_name(1), Some(c"blob0.bundle"));
+    }
+}
+
+#[test]
+fn remastered_metadata_preserves_wide_values_and_legacy_rejects_them() {
+    let mut metadata = Metadata::new();
+    metadata.version = 7;
+    metadata.entry_infos[0].offset_in_bundle = u64::from(u32::MAX) + 1024;
+    metadata.bundle_infos[0].data_block_size = u64::from(u32::MAX) + 2048;
+    let parsed = Metadata::parse(&metadata.try_write().unwrap()).unwrap();
+    assert_eq!(parsed.entry_infos, metadata.entry_infos);
+    assert_eq!(parsed.bundle_infos, metadata.bundle_infos);
+    metadata.version = 6;
+    assert!(metadata.try_write().is_err());
+    metadata.entry_infos[0].offset_in_bundle = 0;
+    assert!(metadata.try_write().is_err());
+}
+
+#[test]
+fn existing_bundle_index_preserves_unaligned_payload_offsets() {
+    use w3edit::{Bundle, BundleCompression, BundleFormat, BundleItem};
+    for format in [BundleFormat::Legacy, BundleFormat::Remastered] {
+        let bundle = Bundle::from_items(format, vec![
+            BundleItem::new(c"file.bin".into(), b"abc", BundleCompression::None).unwrap(),
+        ]);
+        let mut bytes = bundle.write();
+        let offset = bundle.data_block_offset() as usize + 13;
+        bytes.truncate(offset);
+        bytes.extend_from_slice(b"abc");
+        let size = bytes.len();
+        if format == BundleFormat::Legacy {
+            bytes[8..12].copy_from_slice(&(size as u32).to_le_bytes());
+            bytes[32 + 0x11c..32 + 0x120].copy_from_slice(&(offset as u32).to_le_bytes());
+        } else {
+            bytes[8..16].copy_from_slice(&(size as u64).to_le_bytes());
+            bytes[32 + 0x110..32 + 0x118].copy_from_slice(&(offset as u64).to_le_bytes());
+        }
+        let parsed = Bundle::parse(bytes).unwrap();
+        let metadata = Metadata::from_bundle_files(format, &[(c"blob.bundle", &parsed)]).unwrap();
+        assert_eq!(metadata.entry_infos[1].offset_in_bundle, offset as u64);
+        assert_eq!(metadata.bundle_infos[1].data_block_size, 16);
+        assert_eq!(parsed.items()[0].decompressed().unwrap(), b"abc");
+    }
+}
+
+#[test]
+#[ignore = "requires W3_GAME_DIR pointing at a local game installation"]
+fn installed_remastered_metadata_roundtrip() {
+    let root = PathBuf::from(std::env::var_os("W3_GAME_DIR").expect("set W3_GAME_DIR"));
+    let bytes = std::fs::read(root.join("content/metadata.store")).unwrap();
+    let metadata = Metadata::parse(&bytes).unwrap();
+    assert_eq!(metadata.version, 7);
+    assert!(
+        metadata
+            .entry_infos
+            .iter()
+            .any(|entry| entry.offset_in_bundle > u64::from(u32::MAX))
+    );
+    assert!(
+        metadata
+            .bundle_infos
+            .iter()
+            .any(|bundle| bundle.data_block_size > u64::from(u32::MAX))
+    );
+    assert!(bytes == metadata.write());
+}
+
 // -----------------------------------------------------------------------------
 // Fixtures
 // -----------------------------------------------------------------------------

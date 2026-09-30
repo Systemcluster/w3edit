@@ -15,6 +15,7 @@ name = "w3edit"
 readme = "README.md"
 repository = "https://github.com/Systemcluster/w3edit"
 version = "0.0.1"
+rust-version = "1.92.0"
 
 [lib]
 
@@ -62,15 +63,19 @@ snap = { version = "1.1" }
 zerocopy = { version = "0.8", features = ["derive"] }
 
 clap = { version = "4.6", features = ["std", "color", "suggestions", "derive", "unicode", "wrap_help"], optional = true }
-color-backtrace = { version = "0.7", optional = true }
 console = { version = "0.16", optional = true }
 env_logger = { version = "0.11", optional = true }
-indicatif = { version = "0.18", optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
 
 [features]
 
 default = ["cli"]
-cli = ["dep:clap", "dep:color-backtrace", "dep:console", "dep:env_logger", "dep:indicatif"]
+cli = ["dep:clap", "dep:console", "dep:env_logger", "dep:serde", "dep:serde_json"]
+
+[dev-dependencies]
+
+memmap2 = "0.9"
 
 [package.metadata.docs.rs]
 

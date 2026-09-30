@@ -8,12 +8,35 @@
 //! new page layout. [`merge_mods`] closes that gap by re-computing every
 //! item's page-aligned offset and emitting fresh outputs.
 
+use std::collections::HashMap;
 use std::ffi::CStr;
 
 use crate::build::{PendingBundle, PendingEntry, PendingFile, build_metadata};
-use crate::bundle::Bundle;
+use crate::bundle::{Bundle, BundleFormat, BundleItem};
+use crate::errors::MetadataError;
 use crate::metadata::Metadata;
 use crate::texture_cache::TextureCache;
+
+#[derive(Clone, Copy)]
+struct FileFields {
+    path_hash:        u32,
+    size_in_memory:   u32,
+    compression_type: u32,
+    buffer_size:      Option<u32>,
+    hash:             Option<i64>,
+}
+
+impl FileFields {
+    fn from_bundle_item(item: &BundleItem<'_>) -> Self {
+        Self {
+            path_hash:        0,
+            size_in_memory:   item.size(),
+            compression_type: item.compression() as u32,
+            buffer_size:      None,
+            hash:             None,
+        }
+    }
+}
 
 /// Input files for one mod in an end-to-end merge.
 #[derive(Clone, Copy)]
@@ -73,22 +96,54 @@ pub struct MergedMod<'data> {
 /// requires [`Bundle::write`](crate::bundle::Bundle::write) to serialize).
 /// The returned metadata is self-consistent and can be written immediately.
 pub fn merge_mods<'data>(mods: &[ModInput<'_, 'data>], output_bundle_name: &CStr) -> MergedMod<'data> {
+    merge_mods_inner(mods, output_bundle_name, None)
+}
+
+/// Merge into an explicit target format, rejecting legacy metadata overflow.
+/// Compressed bundle and texture payloads are retained without transcoding.
+pub fn merge_mods_for_format<'data>(
+    mods: &[ModInput<'_, 'data>],
+    output_bundle_name: &CStr,
+    format: BundleFormat,
+) -> Result<MergedMod<'data>, MetadataError> {
+    let merged = merge_mods_inner(mods, output_bundle_name, Some(format));
+    merged.metadata.try_write()?;
+    Ok(merged)
+}
+
+fn merge_mods_inner<'data>(
+    mods: &[ModInput<'_, 'data>],
+    output_bundle_name: &CStr,
+    format: Option<BundleFormat>,
+) -> MergedMod<'data> {
     let texture_sources: Vec<&TextureCache> = mods.iter().filter_map(|m| m.texture_cache).collect();
-    let texture_cache = (!texture_sources.is_empty()).then(|| TextureCache::merge(&texture_sources));
+    let mut texture_cache = (!texture_sources.is_empty()).then(|| TextureCache::merge(&texture_sources));
+    if let (Some(format), Some(cache)) = (format, &mut texture_cache) {
+        cache.version = if format == BundleFormat::Legacy { 6 } else { 7 };
+        for (_, entry) in &mut cache.entries {
+            entry.num_mip_offsets =
+                entry.mip_offset_count() as i32 | if format == BundleFormat::Remastered { 1 << 16 } else { 0 };
+        }
+    }
 
     // 1. Merge bundles and compute final page-aligned offsets.
     let bundles: Vec<&Bundle<'data>> = mods.iter().map(|m| m.bundle).collect();
-    let merged_bundle = Bundle::merge(&bundles);
+    let mut merged_bundle = Bundle::merge(&bundles);
+    if let Some(format) = format {
+        merged_bundle = Bundle::from_items(format, merged_bundle.items().to_vec());
+    }
 
     if merged_bundle.items().is_empty() {
+        let mut metadata = Metadata::new();
+        metadata.version = if merged_bundle.version() == 5 { 7 } else { 6 };
         return MergedMod {
             bundle: merged_bundle,
-            metadata: Metadata::new(),
+            metadata,
             texture_cache,
         };
     }
 
-    let offsets = merged_bundle.compute_offsets();
+    let offsets = merged_bundle.compute_offsets_u64();
 
     // 2. Precompute a `path -> hash` lookup for each source (one HashMap per
     //    mod). Later we'll look up each merged item's fields in these.
@@ -101,39 +156,18 @@ pub fn merge_mods<'data>(mods: &[ModInput<'_, 'data>], output_bundle_name: &CStr
     for (i, item) in merged_bundle.items().iter().enumerate() {
         let name = item.name().to_owned();
         let name_bytes = name.as_bytes();
-
-        let source = mods.iter().enumerate().find_map(|(src_idx, input)| {
-            input
-                .metadata
-                .find_file_id_by_name(name_bytes)
-                .map(|fid| (src_idx, input.metadata, fid))
-        });
-
-        let (path_hash, size_in_memory, compression_type, buffer_size, hash) =
-            if let Some((src_idx, meta, fid)) = source {
-                let fi = meta.file_infos[fid].1;
-                (
-                    fi.path_hash,
-                    fi.size_in_memory,
-                    fi.compression_type,
-                    meta.buffer_size_of(&fi),
-                    source_hash_lookups[src_idx].get(&(fid as i64)).copied(),
-                )
-            } else {
-                // Orphan: no source metadata knows this file. Fill with what the
-                // bundle can tell us; keep hash/buffer absent.
-                (0, item.size(), item.compression() as u32, None, None)
-            };
+        let fields = metadata_fields_for(mods, &source_hash_lookups, name_bytes)
+            .unwrap_or_else(|| FileFields::from_bundle_item(item));
 
         files.push(PendingFile {
-            path: name,
-            path_hash,
-            size_in_bundle: item.zsize(),
-            size_in_memory,
-            compression_type,
-            buffer_size,
-            hash,
-            entries: vec![PendingEntry {
+            path:             name,
+            path_hash:        fields.path_hash,
+            size_in_bundle:   item.zsize(),
+            size_in_memory:   fields.size_in_memory,
+            compression_type: fields.compression_type,
+            buffer_size:      fields.buffer_size,
+            hash:             fields.hash,
+            entries:          vec![PendingEntry {
                 bundle_index:     0,
                 offset_in_bundle: offsets[i],
                 size_in_bundle:   item.zsize(),
@@ -145,16 +179,35 @@ pub fn merge_mods<'data>(mods: &[ModInput<'_, 'data>], output_bundle_name: &CStr
     let bundles_out = vec![PendingBundle {
         name:                  output_bundle_name.to_owned(),
         data_block_offset:     merged_bundle.data_block_offset(),
-        data_block_size:       merged_bundle.data_block_size(),
+        data_block_size:       merged_bundle.data_block_size_u64(),
         burst_data_block_size: 0,
     }];
 
     // 5. Emit the metadata.
-    let metadata = build_metadata(files, bundles_out);
+    let mut metadata = build_metadata(files, bundles_out);
+    metadata.version = if merged_bundle.version() == 5 { 7 } else { 6 };
 
     MergedMod {
         bundle: merged_bundle,
         metadata,
         texture_cache,
     }
+}
+
+fn metadata_fields_for(
+    mods: &[ModInput<'_, '_>],
+    hash_lookups: &[HashMap<i64, i64>],
+    name: &[u8],
+) -> Option<FileFields> {
+    mods.iter().enumerate().find_map(|(source_index, input)| {
+        let file_id = input.metadata.find_file_id_by_name(name)?;
+        let info = input.metadata.file_infos[file_id].1;
+        Some(FileFields {
+            path_hash:        info.path_hash,
+            size_in_memory:   info.size_in_memory,
+            compression_type: info.compression_type,
+            buffer_size:      input.metadata.buffer_size_of(&info),
+            hash:             hash_lookups[source_index].get(&(file_id as i64)).copied(),
+        })
+    })
 }

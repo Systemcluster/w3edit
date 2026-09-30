@@ -8,6 +8,35 @@ use std::path::PathBuf;
 
 use w3edit::{Bundle, Metadata, ModInput, TextureCache, TextureCacheEntry};
 
+#[test]
+fn explicit_merge_target_controls_all_three_outputs() {
+    use w3edit::{BundleFormat, merge_mods_for_format};
+    let (_, bundle, metadata) = parse_mod("modsbn");
+    let cache = TextureCache::parse(&std::fs::read(asset("modsbn", "texture.cache")).unwrap()).unwrap();
+    for format in [BundleFormat::Legacy, BundleFormat::Remastered] {
+        let merged = merge_mods_for_format(
+            &[ModInput::new(&bundle, &metadata).with_texture_cache(&cache)],
+            c"blob0.bundle",
+            format,
+        )
+        .unwrap();
+        let bundle = Bundle::parse(merged.bundle.write()).unwrap();
+        let metadata = Metadata::parse(&merged.metadata.write()).unwrap();
+        let cache = merged.texture_cache.unwrap();
+        assert_eq!(bundle.version(), if format == BundleFormat::Legacy { 3 } else { 5 });
+        assert_eq!(metadata.version, if format == BundleFormat::Legacy { 6 } else { 7 });
+        assert_eq!(cache.version, metadata.version);
+        for entry in metadata.entry_infos.iter().skip(1) {
+            let path = metadata.file_path(entry.file_id as usize).unwrap();
+            let item = bundle.items().iter().find(|item| item.name() == path).unwrap();
+            assert_eq!(entry.offset_in_bundle, item.offset());
+        }
+    }
+    let empty = merge_mods_for_format(&[], c"empty.bundle", BundleFormat::Remastered).unwrap();
+    assert_eq!(empty.bundle.version(), 5);
+    assert_eq!(empty.metadata.version, 7);
+}
+
 // -----------------------------------------------------------------------------
 // Fixtures
 // -----------------------------------------------------------------------------
@@ -56,70 +85,32 @@ fn merge_mods<'data>(mods: &[(&Bundle<'data>, &Metadata)], output_bundle_name: &
     (merged.bundle, merged.metadata)
 }
 
-fn align_up(value: usize, align: usize) -> usize {
-    (value + (align - 1)) & !(align - 1)
-}
-
-fn push_texture_string(string_table: &mut Vec<u8>, value: &str) -> i32 {
-    let offset = string_table.len() as i32;
-    string_table.extend_from_slice(value.as_bytes());
-    string_table.push(0);
-    offset
-}
-
-fn push_texture_page(data_pages: &mut Vec<u8>, mip_index: u8, payload: &[u8]) -> u32 {
-    const PAGE: usize = 4096;
-
-    let offset = align_up(data_pages.len(), PAGE);
-    data_pages.resize(offset, 0);
-    data_pages.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    data_pages.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    data_pages.push(mip_index);
-    data_pages.extend_from_slice(payload);
-    offset as u32
-}
-
 fn texture_cache_fixture(names: &[(&str, u32)]) -> TextureCache {
-    let mut string_table = vec![0];
-    let mut data_pages = Vec::new();
-    let mut mip_offsets = Vec::new();
-    let mut entries = Vec::new();
+    let mut cache = TextureCache::new();
 
     for (idx, &(name, hash)) in names.iter().enumerate() {
-        let string_table_offset = push_texture_string(&mut string_table, name);
-        let page_offset = push_texture_page(&mut data_pages, 0, &[idx as u8 + 1, 2, 3]);
-        let mip_offset = push_texture_page(&mut data_pages, 1, &[idx as u8 + 4, 5]);
-        let mip_offset_index = mip_offsets.len() as i32;
-        mip_offsets.push(mip_offset);
-
-        entries.push((CString::new(name).unwrap(), TextureCacheEntry {
-            hash,
-            string_table_offset,
-            page_offset,
-            compressed_size: 3,
-            uncompressed_size: 3,
-            base_alignment: 16,
-            base_width: 64 + idx as u16,
-            base_height: 32,
-            mipcount: 2,
-            slice_count: 1,
-            mip_offset_index,
-            num_mip_offsets: 1,
-            time_stamp: 10 + idx as i64,
-            type1: 1,
-            type2: 2,
-            is_cube: 0,
-            unk1: 9,
-        }));
+        cache
+            .insert(
+                CString::new(name).unwrap(),
+                TextureCacheEntry {
+                    hash,
+                    base_alignment: 16,
+                    base_width: 64 + idx as u16,
+                    base_height: 32,
+                    mipcount: 2,
+                    slice_count: 1,
+                    time_stamp: 10 + idx as i64,
+                    type1: 1,
+                    type2: 2,
+                    is_cube: 0,
+                    unk1: 9,
+                    ..TextureCacheEntry::default()
+                },
+                &[&[idx as u8 + 1, 2, 3], &[idx as u8 + 4, 5]],
+            )
+            .unwrap();
     }
-
-    TextureCache {
-        version: 3,
-        data_pages,
-        mip_offsets,
-        string_table,
-        entries,
-    }
+    cache
 }
 
 // -----------------------------------------------------------------------------
@@ -235,8 +226,7 @@ fn merge_mods_merges_texture_caches_with_mod_priority() {
     assert_eq!(shared.1.hash, 11, "first mod's texture entry should win");
 
     for (_, entry) in &texture_cache.entries {
-        assert_eq!(entry.page_offset as usize % 4096, 0);
-        assert!(entry.page_offset as usize + 9 + entry.compressed_size as usize <= texture_cache.data_pages.len());
+        assert!(entry.page_offset as usize * 4096 + entry.compressed_size as usize <= texture_cache.data_pages.len());
     }
     assert_eq!(
         texture_cache.write(),
@@ -307,7 +297,7 @@ fn merge_mods_metadata_offsets_match_bundle_layout() {
     let (_, bb, bm) = parse_mod("modsbn");
     let (bundle, meta) = merge_mods(&[(&ab, &am), (&bb, &bm)], &bundle_name());
 
-    let offsets = bundle.compute_offsets();
+    let offsets = bundle.compute_offsets_u64();
     for (i, item) in bundle.items().iter().enumerate() {
         // Find the file_info for this item's name.
         let (fid, (_, fi)) = meta
@@ -350,7 +340,7 @@ fn merge_mods_bundle_infos_has_exactly_one_real_bundle() {
     assert_eq!(bi.first_file_entry, 1);
     assert_eq!(bi.num_bundle_entries as usize, bundle.items().len());
     assert_eq!(bi.data_block_offset, bundle.data_block_offset());
-    assert_eq!(bi.data_block_size, bundle.data_block_size());
+    assert_eq!(bi.data_block_size, bundle.data_block_size_u64());
 }
 
 #[test]

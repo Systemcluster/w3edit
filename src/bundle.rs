@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 use std::ffi::{CStr, CString};
 use std::fmt::Debug;
-use std::io::Read;
+use std::io::{Read, Write};
 
 use log::debug;
 
@@ -20,6 +20,22 @@ const MAGIC: &[u8; 8] = b"POTATO70";
 
 /// Size of one TOC entry in bytes.
 const TOC_ENTRY_SIZE: usize = 0x140;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+pub enum BundleFormat {
+    Legacy,
+    Remastered,
+}
+
+impl BundleFormat {
+    fn entry_size(self) -> usize {
+        match self {
+            Self::Legacy => TOC_ENTRY_SIZE,
+            Self::Remastered => 0x130,
+        }
+    }
+}
 
 /// Bundle header size (magic + 3×u32 + mystery bytes).
 const HEADER_SIZE: usize = 0x20;
@@ -92,32 +108,103 @@ pub struct BundleItem<'a> {
     pub(crate) empty:       u32,
     pub(crate) size:        u32,
     pub(crate) zsize:       u32,
-    pub(crate) offset:      u32,
+    pub(crate) offset:      u64,
     pub(crate) date:        u32,
     pub(crate) time:        u32,
     pub(crate) zero:        u128,
     pub(crate) crc:         u32,
     pub(crate) compression: u32,
+    pub(crate) format:      BundleFormat,
+    pub(crate) reserved:    [u8; 8],
 }
 
 impl<'a> BundleItem<'a> {
-    /// Parse a single 0x140-byte TOC entry, pairing it with the item's compressed data slice.
-    pub(crate) fn from_toc(entry: &[u8], data: Cow<'a, [u8]>) -> Result<Self, BundleError> {
-        if entry.len() < TOC_ENTRY_SIZE {
+    /// Compress a file for a new bundle. Names must fit the 256-byte TOC field.
+    pub fn new(name: CString, data: &[u8], compression: BundleCompression) -> Result<Self, BundleError> {
+        if name.as_bytes().is_empty() || name.as_bytes().len() >= OFF_HASH {
+            return Err(ReadError("bundle names must contain 1..255 bytes".into()).into());
+        }
+        let size = u32::try_from(data.len()).map_err(|_| ReadError("file exceeds u32".into()))?;
+        let compressed = match compression {
+            BundleCompression::None => data.to_vec(),
+            BundleCompression::Zlib => {
+                let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+                encoder.write_all(data).map_err(|error| ReadError(error.to_string()))?;
+                encoder.finish().map_err(|error| ReadError(error.to_string()))?
+            },
+            BundleCompression::Snappy => snap::raw::Encoder::new()
+                .compress_vec(data)
+                .map_err(|error| ReadError(error.to_string()))?,
+            BundleCompression::Lz4 | BundleCompression::Lz4hc => {
+                let mode = if compression == BundleCompression::Lz4hc {
+                    lz4::block::CompressionMode::HIGHCOMPRESSION(9)
+                } else {
+                    lz4::block::CompressionMode::DEFAULT
+                };
+                lz4::block::compress(data, Some(mode), false).map_err(|error| ReadError(error.to_string()))?
+            },
+            unsupported => return Err(BundleError::UnsupportedCompression(format!("{unsupported:?}"))),
+        };
+        let zsize = u32::try_from(compressed.len()).map_err(|_| ReadError("compressed file exceeds u32".into()))?;
+        let mut crc = flate2::Crc::new();
+        crc.update(data);
+        Ok(Self {
+            data: Cow::Owned(compressed),
+            name,
+            hash: 0,
+            empty: 0,
+            size,
+            zsize,
+            offset: 0,
+            date: 0,
+            time: 0,
+            zero: 0,
+            crc: crc.sum(),
+            compression: compression as u32,
+            format: BundleFormat::Legacy,
+            reserved: [0; 8],
+        })
+    }
+
+    fn from_toc(entry: &[u8], data: Cow<'a, [u8]>, format: BundleFormat) -> Result<Self, BundleError> {
+        let entry_size = format.entry_size();
+        if entry.len() < entry_size {
             return Err(BundleError::InvalidBytes(ReadError(format!(
                 "toc entry too short: {} < {}",
                 entry.len(),
-                TOC_ENTRY_SIZE
+                entry_size
             ))));
         }
         let name = CStr::from_bytes_until_nul(&entry[OFF_NAME..OFF_HASH])
             .map_err(|e| ReadError(e.to_string()))?
             .to_owned();
         let hash = read::<u128>(&entry[OFF_HASH..OFF_EMPTY])?;
+        if format == BundleFormat::Remastered {
+            let zsize = read::<u32>(&entry[0x11c..0x120])?;
+            if data.len() != zsize as usize {
+                return Err(ReadError("item data length does not match zsize".to_string()).into());
+            }
+            return Ok(Self {
+                data,
+                name,
+                hash,
+                empty: 0,
+                size: read::<u32>(&entry[0x118..0x11c])?,
+                zsize,
+                offset: read::<u64>(&entry[0x110..0x118])?,
+                date: 0,
+                time: 0,
+                zero: 0,
+                crc: read::<u32>(&entry[0x120..0x124])?,
+                compression: read::<u32>(&entry[0x124..0x128])?,
+                format,
+                reserved: read::<[u8; 8]>(&entry[0x128..0x130])?,
+            });
+        }
         let empty = read::<u32>(&entry[OFF_EMPTY..OFF_SIZE])?;
         let size = read::<u32>(&entry[OFF_SIZE..OFF_ZSIZE])?;
         let zsize = read::<u32>(&entry[OFF_ZSIZE..OFF_OFFSET])?;
-        let offset = read::<u32>(&entry[OFF_OFFSET..OFF_DATE])?;
+        let offset = u64::from(read::<u32>(&entry[OFF_OFFSET..OFF_DATE])?);
         let date = read::<u32>(&entry[OFF_DATE..OFF_TIME])?;
         let time = read::<u32>(&entry[OFF_TIME..OFF_ZERO])?;
         let zero = read::<u128>(&entry[OFF_ZERO..OFF_CRC])?;
@@ -145,6 +232,8 @@ impl<'a> BundleItem<'a> {
             zero,
             crc,
             compression,
+            format,
+            reserved: [0; 8],
         })
     }
 
@@ -171,7 +260,7 @@ impl<'a> BundleItem<'a> {
     /// Absolute offset of this item's data page within its containing bundle,
     /// as recorded in the TOC. For freshly-merged bundles (before [`Bundle::write`])
     /// this value is stale; [`Bundle::write`] recomputes it at serialization time.
-    pub fn offset(&self) -> u32 {
+    pub fn offset(&self) -> u64 {
         self.offset
     }
 
@@ -190,17 +279,34 @@ impl<'a> BundleItem<'a> {
         &self.data
     }
 
-    /// Serialize this item's TOC entry (0x140 bytes) with its currently stored `offset`.
+    /// Serialize this item's TOC entry in its source format with its stored `offset`.
     /// [`Bundle::write`] patches the offset field to the new data-page position.
     pub fn header(&self) -> Vec<u8> {
-        let mut header = Vec::with_capacity(TOC_ENTRY_SIZE);
+        self.header_for_format(self.format, self.offset)
+    }
+
+    fn header_for_format(&self, format: BundleFormat, offset: u64) -> Vec<u8> {
+        let mut header = Vec::with_capacity(format.entry_size());
         header.extend(self.name.as_bytes());
         header.resize(OFF_HASH, 0);
         header.extend(self.hash.to_le_bytes());
+        if format == BundleFormat::Remastered {
+            header.extend(offset.to_le_bytes());
+            header.extend(self.size.to_le_bytes());
+            header.extend(self.zsize.to_le_bytes());
+            header.extend(self.crc.to_le_bytes());
+            header.extend(self.compression.to_le_bytes());
+            header.extend(self.reserved);
+            return header;
+        }
         header.extend(self.empty.to_le_bytes());
         header.extend(self.size.to_le_bytes());
         header.extend(self.zsize.to_le_bytes());
-        header.extend(self.offset.to_le_bytes());
+        header.extend(
+            u32::try_from(offset)
+                .expect("legacy bundle offset exceeds u32")
+                .to_le_bytes(),
+        );
         header.extend(self.date.to_le_bytes());
         header.extend(self.time.to_le_bytes());
         header.extend(self.zero.to_le_bytes());
@@ -258,20 +364,24 @@ impl Debug for BundleItem<'_> {
 /// A parsed or constructed `.bundle` container.
 #[derive(Clone)]
 pub struct Bundle<'a> {
-    pub(crate) bundle_size: u32,
-    pub(crate) dummy_size:  u32,
-    pub(crate) data_offset: u32,
-    pub(crate) items:       Vec<BundleItem<'a>>,
+    pub(crate) bundle_size:     u64,
+    pub(crate) dummy_size:      u32,
+    pub(crate) data_offset:     u32,
+    pub(crate) items:           Vec<BundleItem<'a>>,
+    pub(crate) format:          BundleFormat,
+    pub(crate) header_reserved: [u8; 2],
 }
 
 impl Bundle<'static> {
-    /// Construct an empty bundle. Use [`Bundle::merge`] to combine items from existing bundles.
+    /// Construct an empty legacy bundle. Use [`Bundle::from_items`] for explicit-format creation.
     pub fn new() -> Self {
         Bundle {
-            bundle_size: 0,
-            dummy_size:  0,
-            data_offset: 0,
-            items:       Vec::new(),
+            bundle_size:     0,
+            dummy_size:      0,
+            data_offset:     0,
+            items:           Vec::new(),
+            format:          BundleFormat::Legacy,
+            header_reserved: [0; 2],
         }
     }
 }
@@ -283,6 +393,21 @@ impl Default for Bundle<'static> {
 }
 
 impl<'a> Bundle<'a> {
+    /// Construct a bundle for an explicit game format from compressed entries.
+    pub fn from_items(format: BundleFormat, mut items: Vec<BundleItem<'a>>) -> Self {
+        for item in &mut items {
+            item.format = format;
+        }
+        Self {
+            bundle_size: 0,
+            dummy_size: 0,
+            data_offset: u32::try_from(items.len() * format.entry_size()).expect("bundle TOC exceeds u32"),
+            items,
+            format,
+            header_reserved: [0; 2],
+        }
+    }
+
     /// Parse a bundle from bytes.
     ///
     /// Accepts either a borrowed slice (`&'a [u8]`, zero-copy) or an owned buffer
@@ -291,7 +416,7 @@ impl<'a> Bundle<'a> {
         let data: Cow<'a, [u8]> = data.into();
 
         // Header: read fields via a temporary borrow that ends before we consume `data`.
-        let (bundle_size, dummy_size, data_offset) = {
+        let (bundle_size, dummy_size, data_offset, format, header_reserved) = {
             let d: &[u8] = &data;
             if d.len() < HEADER_SIZE {
                 return Err(BundleError::InvalidBytes(ReadError(format!(
@@ -307,19 +432,31 @@ impl<'a> Bundle<'a> {
                     String::from_utf8_lossy(&magic)
                 ))));
             }
+            let format = match read::<u16>(&d[20..22])? {
+                3 => BundleFormat::Legacy,
+                5 => BundleFormat::Remastered,
+                version => return Err(ReadError(format!("unsupported bundle version {version}")).into()),
+            };
+            let (bundle_size, dummy_size) = match format {
+                BundleFormat::Legacy => (u64::from(read::<u32>(&d[8..12])?), read::<u32>(&d[12..16])?),
+                BundleFormat::Remastered => (read::<u64>(&d[8..16])?, 0),
+            };
             (
-                read::<u32>(&d[8..12])?,
-                read::<u32>(&d[12..16])?,
+                bundle_size,
+                dummy_size,
                 read::<u32>(&d[16..20])?,
+                format,
+                read::<[u8; 2]>(&d[30..32])?,
             )
         };
 
         // TOC layout sanity: the TOC must fit in the file and its size must be a
         // whole multiple of a TOC entry.
         let toc_size = data_offset as usize;
-        if !toc_size.is_multiple_of(TOC_ENTRY_SIZE) {
+        let entry_size = format.entry_size();
+        if !toc_size.is_multiple_of(entry_size) {
             return Err(BundleError::InvalidBytes(ReadError(format!(
-                "toc size {toc_size} is not a multiple of {TOC_ENTRY_SIZE}"
+                "toc size {toc_size} is not a multiple of {entry_size}"
             ))));
         }
         let toc_end = HEADER_SIZE
@@ -334,11 +471,11 @@ impl<'a> Bundle<'a> {
 
         // Collect TOC entry positions.
         let toc_start = HEADER_SIZE;
-        let mut toc_positions: Vec<usize> = Vec::with_capacity(toc_size / TOC_ENTRY_SIZE);
+        let mut toc_positions: Vec<usize> = Vec::with_capacity(toc_size / entry_size);
         let mut pos = toc_start;
         while pos < toc_end {
             toc_positions.push(pos);
-            pos += TOC_ENTRY_SIZE;
+            pos += entry_size;
         }
 
         // Extract items. Match on the Cow variant so borrowed input stays zero-copy
@@ -348,19 +485,19 @@ impl<'a> Bundle<'a> {
             Cow::Borrowed(bytes) => toc_positions
                 .into_iter()
                 .map(|toc_pos| -> Result<BundleItem<'a>, BundleError> {
-                    let entry = check_entry(bytes, toc_pos)?;
-                    let (offset, zsize) = entry_data_range(entry)?;
+                    let entry = check_entry(bytes, toc_pos, entry_size)?;
+                    let (offset, zsize) = entry_data_range(entry, format)?;
                     let slice: &'a [u8] = check_range(bytes, offset, zsize)?;
-                    BundleItem::from_toc(entry, Cow::Borrowed(slice))
+                    BundleItem::from_toc(entry, Cow::Borrowed(slice), format)
                 })
                 .collect::<Result<Vec<_>, _>>()?,
             Cow::Owned(vec) => toc_positions
                 .into_iter()
                 .map(|toc_pos| -> Result<BundleItem<'a>, BundleError> {
-                    let entry = check_entry(&vec, toc_pos)?;
-                    let (offset, zsize) = entry_data_range(entry)?;
+                    let entry = check_entry(&vec, toc_pos, entry_size)?;
+                    let (offset, zsize) = entry_data_range(entry, format)?;
                     let slice = check_range(&vec, offset, zsize)?;
-                    BundleItem::from_toc(entry, Cow::Owned(slice.to_vec()))
+                    BundleItem::from_toc(entry, Cow::Owned(slice.to_vec()), format)
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         };
@@ -372,12 +509,22 @@ impl<'a> Bundle<'a> {
             dummy_size,
             data_offset,
             items,
+            format,
+            header_reserved,
         })
     }
 
     /// The items in this bundle, in TOC order.
     pub fn items(&self) -> &[BundleItem<'a>] {
         &self.items
+    }
+
+    /// On-disk bundle version: 3 (legacy) or 5 (Remastered).
+    pub fn version(&self) -> u16 {
+        match self.format {
+            BundleFormat::Legacy => 3,
+            BundleFormat::Remastered => 5,
+        }
     }
 
     /// The value of the `dummy_size` header field (preserved as-is from the source).
@@ -393,13 +540,23 @@ impl<'a> Bundle<'a> {
     /// This is the same layout [`Bundle::write`] uses. It's public so that
     /// callers (for example, the `metadata.store` writer) can align metadata
     /// entries to the same byte positions without re-serializing the bundle.
+    /// Panics if an offset exceeds the legacy metadata format's 32-bit limit;
+    /// use [`Self::compute_offsets_u64`] for large version-5 bundles.
     pub fn compute_offsets(&self) -> Vec<u32> {
-        let toc_size = self.items.len() * TOC_ENTRY_SIZE;
+        self.compute_offsets_u64()
+            .into_iter()
+            .map(|offset| u32::try_from(offset).expect("bundle offset exceeds legacy metadata's u32 limit"))
+            .collect()
+    }
+
+    /// Compute serialization offsets without the legacy metadata format's 32-bit limit.
+    pub fn compute_offsets_u64(&self) -> Vec<u64> {
+        let toc_size = self.items.len() * self.format.entry_size();
         let toc_end = HEADER_SIZE + toc_size;
         let mut offsets = Vec::with_capacity(self.items.len());
         let mut pos = align_up(toc_end, PAGE);
         for item in &self.items {
-            offsets.push(pos as u32);
+            offsets.push(pos as u64);
             pos = align_up(pos + item.zsize as usize, PAGE);
         }
         offsets
@@ -409,7 +566,7 @@ impl<'a> Bundle<'a> {
     /// after the header and TOC. Matches the `data_block_offset` field written
     /// into `metadata.store::bundle_infos`.
     pub fn data_block_offset(&self) -> u32 {
-        (HEADER_SIZE + self.items.len() * TOC_ENTRY_SIZE) as u32
+        u32::try_from(HEADER_SIZE + self.items.len() * self.format.entry_size()).expect("bundle TOC exceeds u32")
     }
 
     /// Size of the bundle's page-aligned data region (from
@@ -417,13 +574,18 @@ impl<'a> Bundle<'a> {
     /// item's page). Matches the `data_block_size` field written into
     /// `metadata.store::bundle_infos`.
     pub fn data_block_size(&self) -> u32 {
+        u32::try_from(self.data_block_size_u64()).expect("bundle data size exceeds legacy metadata's u32 limit")
+    }
+
+    /// Size of the page-aligned data region without the legacy 32-bit limit.
+    pub fn data_block_size_u64(&self) -> u64 {
         if self.items.is_empty() {
             return 0;
         }
-        let offsets = self.compute_offsets();
+        let offsets = self.compute_offsets_u64();
         let last = self.items.len() - 1;
         let end = offsets[last] as usize + self.items[last].zsize as usize;
-        (align_up(end, PAGE) - self.data_block_offset() as usize) as u32
+        (align_up(end, PAGE) - self.data_block_offset() as usize) as u64
     }
 
     /// Serialize the bundle to a byte vector.
@@ -431,9 +593,16 @@ impl<'a> Bundle<'a> {
     /// Each item's compressed bytes are copied verbatim and placed at page-aligned offsets.
     /// The output is a valid bundle that can be written to disk and read back by [`Bundle::parse`].
     pub fn write(&self) -> Vec<u8> {
-        let toc_size = self.items.len() * TOC_ENTRY_SIZE;
+        self.try_write()
+            .expect("bundle cannot be represented in its target format")
+    }
+
+    /// Serialize, returning an error if the legacy size limit is exceeded.
+    pub fn try_write(&self) -> Result<Vec<u8>, BundleError> {
+        let entry_size = self.format.entry_size();
+        let toc_size = self.items.len() * entry_size;
         let toc_end = HEADER_SIZE + toc_size;
-        let item_offsets = self.compute_offsets();
+        let item_offsets = self.compute_offsets_u64();
 
         let total_size = if self.items.is_empty() {
             toc_end
@@ -442,22 +611,39 @@ impl<'a> Bundle<'a> {
             item_offsets[last] as usize + self.items[last].zsize as usize
         };
 
+        if self.format == BundleFormat::Legacy && total_size > u32::MAX as usize {
+            return Err(ReadError("legacy bundle size exceeds u32".into()).into());
+        }
+
         // Phase 2: fill a zeroed output buffer (zero bytes serve as page padding).
         let mut out = vec![0u8; total_size];
 
         // Header (32 bytes).
         out[0..8].copy_from_slice(MAGIC);
-        out[8..12].copy_from_slice(&(total_size as u32).to_le_bytes());
-        out[12..16].copy_from_slice(&self.dummy_size.to_le_bytes());
-        out[16..20].copy_from_slice(&(toc_size as u32).to_le_bytes());
-        out[20..32].copy_from_slice(&MYSTERY_BYTES);
+        out[16..20].copy_from_slice(&u32::try_from(toc_size).expect("bundle TOC exceeds u32").to_le_bytes());
+        match self.format {
+            BundleFormat::Legacy => {
+                out[8..12].copy_from_slice(
+                    &u32::try_from(total_size)
+                        .expect("legacy bundle size exceeds u32")
+                        .to_le_bytes(),
+                );
+                out[12..16].copy_from_slice(&self.dummy_size.to_le_bytes());
+                out[20..32].copy_from_slice(&MYSTERY_BYTES);
+            },
+            BundleFormat::Remastered => {
+                out[8..16].copy_from_slice(&(total_size as u64).to_le_bytes());
+                out[20..22].copy_from_slice(&5u16.to_le_bytes());
+                out[22..30].copy_from_slice(&(toc_end as u64).to_le_bytes());
+                out[30..32].copy_from_slice(&self.header_reserved);
+            },
+        }
 
         // TOC: emit each item's header with its offset field patched to the new page position.
         for (i, item) in self.items.iter().enumerate() {
-            let toc_pos = HEADER_SIZE + i * TOC_ENTRY_SIZE;
-            let mut entry = item.header();
-            entry[OFF_OFFSET..OFF_OFFSET + 4].copy_from_slice(&item_offsets[i].to_le_bytes());
-            out[toc_pos..toc_pos + TOC_ENTRY_SIZE].copy_from_slice(&entry);
+            let toc_pos = HEADER_SIZE + i * entry_size;
+            let entry = item.header_for_format(self.format, item_offsets[i]);
+            out[toc_pos..toc_pos + entry_size].copy_from_slice(&entry);
         }
 
         // Data: copy each item's compressed bytes into its slot. Gaps stay zero.
@@ -467,7 +653,7 @@ impl<'a> Bundle<'a> {
             out[dst..dst + len].copy_from_slice(&item.data[..len]);
         }
 
-        out
+        Ok(out)
     }
 
     /// Merge multiple bundles into one with order-based prioritization.
@@ -485,6 +671,7 @@ impl<'a> Bundle<'a> {
     ///
     /// The `dummy_size` field is inherited from the first (highest-priority)
     /// bundle; when the input is empty, an empty bundle is returned.
+    /// If any input uses version 5, the output uses version 5 as well.
     pub fn merge(bundles: &[&Bundle<'a>]) -> Bundle<'a> {
         use std::collections::HashSet;
 
@@ -499,13 +686,25 @@ impl<'a> Bundle<'a> {
         }
 
         let dummy_size = bundles.first().map(|b| b.dummy_size).unwrap_or(0);
-        let data_offset = (items.len() * TOC_ENTRY_SIZE) as u32;
+        let format = if bundles.iter().any(|bundle| bundle.format == BundleFormat::Remastered) {
+            BundleFormat::Remastered
+        } else {
+            BundleFormat::Legacy
+        };
+        let header_reserved = bundles
+            .iter()
+            .find(|bundle| bundle.format == format)
+            .map(|bundle| bundle.header_reserved)
+            .unwrap_or([0; 2]);
+        let data_offset = u32::try_from(items.len() * format.entry_size()).expect("bundle TOC exceeds u32");
 
         Bundle {
             bundle_size: 0,
             dummy_size,
             data_offset,
             items,
+            format,
+            header_reserved,
         }
     }
 }
@@ -513,6 +712,7 @@ impl<'a> Bundle<'a> {
 impl Debug for Bundle<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Bundle")
+            .field("version", &self.version())
             .field("bundle_size", &self.bundle_size)
             .field("dummy_size", &self.dummy_size)
             .field("data_offset", &self.data_offset)
@@ -531,22 +731,28 @@ fn align_up(value: usize, align: usize) -> usize {
     value.div_ceil(align) * align
 }
 
-/// Bounds-checked slice of a single 0x140-byte TOC entry.
+/// Bounds-checked slice of a single TOC entry.
 #[inline]
-fn check_entry(bytes: &[u8], toc_pos: usize) -> Result<&[u8], BundleError> {
-    if toc_pos + TOC_ENTRY_SIZE > bytes.len() {
+fn check_entry(bytes: &[u8], toc_pos: usize, entry_size: usize) -> Result<&[u8], BundleError> {
+    if toc_pos + entry_size > bytes.len() {
         return Err(BundleError::InvalidBytes(ReadError(format!(
             "toc entry at {:#x} exceeds buffer len {}",
             toc_pos,
             bytes.len()
         ))));
     }
-    Ok(&bytes[toc_pos..toc_pos + TOC_ENTRY_SIZE])
+    Ok(&bytes[toc_pos..toc_pos + entry_size])
 }
 
 /// Extract `(offset, zsize)` from a TOC entry.
 #[inline]
-fn entry_data_range(entry: &[u8]) -> Result<(usize, usize), BundleError> {
+fn entry_data_range(entry: &[u8], format: BundleFormat) -> Result<(usize, usize), BundleError> {
+    if format == BundleFormat::Remastered {
+        let offset = usize::try_from(read::<u64>(&entry[0x110..0x118])?)
+            .map_err(|_| ReadError("bundle offset exceeds usize".to_string()))?;
+        let zsize = read::<u32>(&entry[0x11c..0x120])? as usize;
+        return Ok((offset, zsize));
+    }
     let zsize = read::<u32>(&entry[OFF_ZSIZE..OFF_OFFSET])? as usize;
     let offset = read::<u32>(&entry[OFF_OFFSET..OFF_DATE])? as usize;
     Ok((offset, zsize))
@@ -555,13 +761,16 @@ fn entry_data_range(entry: &[u8]) -> Result<(usize, usize), BundleError> {
 /// Bounds-checked slice covering an item's compressed payload.
 #[inline]
 fn check_range(bytes: &[u8], offset: usize, zsize: usize) -> Result<&[u8], BundleError> {
-    if offset.saturating_add(zsize) > bytes.len() {
+    let end = offset
+        .checked_add(zsize)
+        .ok_or_else(|| ReadError("item data range overflows usize".to_string()))?;
+    if end > bytes.len() {
         return Err(BundleError::InvalidBytes(ReadError(format!(
             "item data at {:#x}..{:#x} exceeds buffer len {}",
             offset,
-            offset + zsize,
+            end,
             bytes.len()
         ))));
     }
-    Ok(&bytes[offset..offset + zsize])
+    Ok(&bytes[offset..end])
 }

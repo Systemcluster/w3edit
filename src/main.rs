@@ -1,13 +1,11 @@
-use log::debug;
+mod cli;
 
-use w3edit::bundle::Bundle;
-use w3edit::metadata::Metadata;
+use std::process::ExitCode;
 
-
-fn main() {
+fn main() -> ExitCode {
     env_logger::builder()
         .is_test(false)
-        .filter_level(log::LevelFilter::Trace)
+        .parse_env(env_logger::Env::default().default_filter_or("warn"))
         .format_timestamp(None)
         .format_module_path(false)
         .format_level(true)
@@ -15,17 +13,11 @@ fn main() {
         .write_style(env_logger::WriteStyle::Auto)
         .init();
 
-    let data = std::fs::read("test/assets/modnmm/blob0.bundle").unwrap();
-    let bundle = Bundle::parse(data).unwrap();
-    debug!("{:#?}", bundle);
-
-    // for item in bundle.items() {
-    //     let path = Path::new("test/assets/unpack").join(item.name().to_str().unwrap());
-    //     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    //     std::fs::write(&path, item.decompressed().unwrap()).unwrap();
-    // }
-
-    let data = std::fs::read("test/assets/modnmm/metadata.store").unwrap();
-    let metadata = Metadata::parse(&data).unwrap();
-    debug!("{:#?}", metadata);
+    match cli::run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        },
+    }
 }

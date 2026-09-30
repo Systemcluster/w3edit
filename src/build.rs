@@ -136,29 +136,29 @@ impl DirTreeBuilder {
 /// The `bundle_index` inside each [`PendingEntry`] is a 0-based index into
 /// the `bundles` slice passed to `build_metadata`.
 pub(crate) struct PendingFile {
-    pub path:             CString,
-    pub path_hash:        u32,
-    pub size_in_bundle:   u32,
-    pub size_in_memory:   u32,
-    pub compression_type: u32,
-    pub buffer_size:      Option<u32>,
-    pub hash:             Option<i64>,
+    pub(crate) path:             CString,
+    pub(crate) path_hash:        u32,
+    pub(crate) size_in_bundle:   u32,
+    pub(crate) size_in_memory:   u32,
+    pub(crate) compression_type: u32,
+    pub(crate) buffer_size:      Option<u32>,
+    pub(crate) hash:             Option<i64>,
     /// Zero or more entries (one per bundle this file appears in).
-    pub entries:          Vec<PendingEntry>,
+    pub(crate) entries:          Vec<PendingEntry>,
 }
 
 pub(crate) struct PendingEntry {
     /// 0-based index into `bundles` passed to `build_metadata`.
-    pub bundle_index:     usize,
-    pub offset_in_bundle: u32,
-    pub size_in_bundle:   u32,
+    pub(crate) bundle_index:     usize,
+    pub(crate) offset_in_bundle: u64,
+    pub(crate) size_in_bundle:   u32,
 }
 
 pub(crate) struct PendingBundle {
-    pub name:                  CString,
-    pub data_block_offset:     u32,
-    pub data_block_size:       u32,
-    pub burst_data_block_size: u32,
+    pub(crate) name:                  CString,
+    pub(crate) data_block_offset:     u32,
+    pub(crate) data_block_size:       u64,
+    pub(crate) burst_data_block_size: u32,
 }
 
 

@@ -4,8 +4,9 @@
 //! several info tables and an EOF footer. Unlike most formats in this crate, the
 //! magic (`HCXT`) lives in the footer rather than at byte zero.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ffi::{CStr, CString};
+use std::io::Write;
 
 use crate::errors::*;
 use crate::hash::fnv64;
@@ -16,7 +17,6 @@ const MAGIC: &[u8; 4] = b"HCXT";
 const FOOTER_SIZE: usize = 32;
 const ENTRY_SIZE: usize = 52;
 const PAGE: usize = 4096;
-const PAGE_HEADER_SIZE: usize = 9;
 
 const OFF_HASH: usize = 0;
 const OFF_STRING_TABLE: usize = 4;
@@ -60,6 +60,11 @@ pub struct TextureCacheEntry {
 }
 
 impl TextureCacheEntry {
+    /// Number of relative mip offsets; version 7 stores flags in the upper half.
+    pub fn mip_offset_count(&self) -> usize {
+        (self.num_mip_offsets as u32 & 0xffff) as usize
+    }
+
     fn parse(bytes: &[u8]) -> Result<Self, ReadError> {
         if bytes.len() < ENTRY_SIZE {
             return Err(ReadError(format!(
@@ -132,12 +137,81 @@ impl TextureCache {
     /// Construct an empty cache with a NUL string-table sentinel.
     pub fn new() -> Self {
         Self {
-            version:      1,
+            version:      6,
             data_pages:   Vec::new(),
             mip_offsets:  Vec::new(),
             string_table: vec![0],
             entries:      Vec::new(),
         }
+    }
+
+    /// Create a legacy (version 6) or remastered (version 7) texture cache.
+    pub fn for_format(format: crate::BundleFormat) -> Self {
+        Self {
+            version: if format == crate::BundleFormat::Legacy { 6 } else { 7 },
+            ..Self::new()
+        }
+    }
+
+    /// Add already-cooked GPU texture data, split into streaming chunks from
+    /// largest mip to smallest. The last chunk may contain several small mips.
+    /// Descriptor dimensions, format bytes and hash are supplied by the caller;
+    /// sizes, offsets and streaming headers are generated here.
+    pub fn insert(
+        &mut self,
+        name: CString,
+        mut descriptor: TextureCacheEntry,
+        chunks: &[&[u8]],
+    ) -> Result<(), TextureCacheError> {
+        if !matches!(self.version, 6 | 7) {
+            return Err(layout_error("creation requires texture cache version 6 or 7").into());
+        }
+        if name.as_bytes().is_empty() || self.find_entry_by_name(name.as_bytes()).is_some() {
+            return Err(layout_error("texture name is empty or duplicated").into());
+        }
+        if chunks.is_empty()
+            || chunks.len() > 256
+            || chunks.len() > usize::from(descriptor.mipcount)
+            || descriptor.base_width == 0
+            || descriptor.base_height == 0
+            || descriptor.slice_count == 0
+        {
+            return Err(layout_error("invalid texture dimensions or streaming chunk count").into());
+        }
+        let mut stream = Vec::new();
+        let mut offsets = Vec::new();
+        let mut uncompressed_size = 0u32;
+        for (index, chunk) in chunks.iter().enumerate() {
+            if index > 0 {
+                offsets.push(u32::try_from(stream.len()).map_err(|_| overflow("texture stream"))?);
+            }
+            let size = u32::try_from(chunk.len()).map_err(|_| overflow("texture chunk"))?;
+            uncompressed_size = uncompressed_size
+                .checked_add(size)
+                .ok_or_else(|| overflow("texture size"))?;
+            let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(chunk).map_err(|error| ReadError(error.to_string()))?;
+            let compressed = encoder.finish().map_err(|error| ReadError(error.to_string()))?;
+            let zsize = u32::try_from(compressed.len()).map_err(|_| overflow("compressed chunk"))?;
+            stream.extend_from_slice(&zsize.to_le_bytes());
+            stream.extend_from_slice(&size.to_le_bytes());
+            stream.push((chunks.len() - index - 1) as u8);
+            stream.extend_from_slice(&compressed);
+        }
+        descriptor.page_offset =
+            u32::try_from(align_up(self.data_pages.len(), PAGE) / PAGE).map_err(|_| overflow("page index"))?;
+        descriptor.compressed_size = u32::try_from(stream.len()).map_err(|_| overflow("texture stream"))?;
+        descriptor.uncompressed_size = uncompressed_size;
+        descriptor.string_table_offset = i32::try_from(self.string_table.len()).map_err(|_| overflow("strings"))?;
+        descriptor.mip_offset_index = i32::try_from(self.mip_offsets.len()).map_err(|_| overflow("mip index"))?;
+        descriptor.num_mip_offsets = offsets.len() as i32 | if self.version == 7 { 1 << 16 } else { 0 };
+        self.data_pages.resize(descriptor.page_offset as usize * PAGE, 0);
+        self.data_pages.extend_from_slice(&stream);
+        self.data_pages.resize(align_up(self.data_pages.len(), PAGE), 0);
+        self.mip_offsets.extend(offsets);
+        push_cstring(&mut self.string_table, &name);
+        self.entries.push((name, descriptor));
+        Ok(())
     }
 
     /// Parse a `texture.cache` from bytes.
@@ -247,9 +321,7 @@ impl TextureCache {
             entries:      Vec::new(),
         };
         let mut seen = HashSet::new();
-        let mut copied_pages: HashMap<(usize, u32), u32> = HashMap::new();
-
-        for (source_index, source) in sources.iter().enumerate() {
+        for source in sources {
             for (name, entry) in &source.entries {
                 if !seen.insert(name.clone()) {
                     continue;
@@ -258,25 +330,20 @@ impl TextureCache {
                 let string_table_offset = push_cstring(&mut out.string_table, name) as i32;
                 let mut new_entry = *entry;
                 new_entry.string_table_offset = string_table_offset;
-                new_entry.page_offset = copy_page(
-                    source_index,
-                    source,
-                    &mut out.data_pages,
-                    &mut copied_pages,
-                    entry.page_offset,
-                );
+                let start = entry.page_offset as usize * PAGE;
+                let end = start + entry.compressed_size as usize;
+                let target = align_up(out.data_pages.len(), PAGE);
+                out.data_pages.resize(target, 0);
+                out.data_pages.extend_from_slice(&source.data_pages[start..end]);
+                out.data_pages.resize(align_up(out.data_pages.len(), PAGE), 0);
+                new_entry.page_offset = u32::try_from(target / PAGE).expect("texture page index exceeds u32");
 
-                if entry.mip_offset_index >= 0 && entry.num_mip_offsets > 0 {
+                if entry.mip_offset_index >= 0 && entry.mip_offset_count() > 0 {
                     let start = entry.mip_offset_index as usize;
-                    let count = entry.num_mip_offsets as usize;
+                    let count = entry.mip_offset_count();
                     if let Some(slice) = source.mip_offsets.get(start..start.saturating_add(count)) {
                         new_entry.mip_offset_index = out.mip_offsets.len() as i32;
-                        new_entry.num_mip_offsets = slice.len() as i32;
-                        for &offset in slice {
-                            let new_offset =
-                                copy_page(source_index, source, &mut out.data_pages, &mut copied_pages, offset);
-                            out.mip_offsets.push(new_offset);
-                        }
+                        out.mip_offsets.extend_from_slice(slice);
                     } else {
                         new_entry.mip_offset_index = -1;
                         new_entry.num_mip_offsets = 0;
@@ -319,39 +386,6 @@ impl TextureCache {
         }
         out
     }
-}
-
-fn copy_page(
-    source_index: usize,
-    source: &TextureCache,
-    out_pages: &mut Vec<u8>,
-    copied_pages: &mut HashMap<(usize, u32), u32>,
-    source_offset: u32,
-) -> u32 {
-    if let Some(&offset) = copied_pages.get(&(source_index, source_offset)) {
-        return offset;
-    }
-
-    let new_offset = align_up(out_pages.len(), PAGE) as u32;
-    out_pages.resize(new_offset as usize, 0);
-
-    if let Some(range) = page_range(&source.data_pages, source_offset) {
-        out_pages.extend_from_slice(&source.data_pages[range]);
-    }
-
-    copied_pages.insert((source_index, source_offset), new_offset);
-    new_offset
-}
-
-fn page_range(data_pages: &[u8], offset: u32) -> Option<std::ops::Range<usize>> {
-    let start = offset as usize;
-    let header_end = start.checked_add(PAGE_HEADER_SIZE)?;
-    if header_end > data_pages.len() {
-        return None;
-    }
-    let zsize = read::<u32>(&data_pages[start..]).ok()? as usize;
-    let end = header_end.checked_add(zsize)?;
-    (end <= data_pages.len()).then_some(start..end)
 }
 
 fn push_cstring(string_table: &mut Vec<u8>, value: &CString) -> usize {

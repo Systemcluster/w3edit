@@ -10,9 +10,12 @@
 //!   `max_size_in_memory: u32`, `string_table_size: vlq_i32`.
 //! - String table: raw bytes; offsets in later records are relative to the start
 //!   of this table. Offset 0 is always a NUL sentinel (empty string).
-//! - Seven [`DynamicArray`]-encoded sections in order: file_infos,
+//! - Seven `DynamicArray`-encoded sections in order: file_infos,
 //!   entry_infos, bundle_infos, buffers, dir_init_infos, file_init_infos,
 //!   hashes.
+//!
+//! Version 7 reorders entry and bundle fields and uses 64-bit offsets and bundle
+//! sizes. Version 6 retains the legacy 32-bit on-disk representation.
 //!
 //! # Index-0 conventions
 //! Observed in all shipped fixtures:
@@ -46,7 +49,7 @@ const HEADER_FIXED_SIZE: usize = 16;
 
 /// Serialised size of a [`MetadataFileInfo`] record.
 const FILE_INFO_SIZE: usize = 32;
-/// Serialised size of a [`MetadataFileEntryInfo`] record.
+/// Legacy serialised size of a [`MetadataFileEntryInfo`] record.
 const ENTRY_INFO_SIZE: usize = 20;
 /// Serialised size of a [`MetadataBundleInfo`] record.
 const BUNDLE_INFO_SIZE: usize = 24;
@@ -87,28 +90,26 @@ pub struct MetadataFileInfo {
 /// One entry in the (file × bundle) chain: points to a bundle and records the
 /// file's offset/size inside that bundle. `next_entry` links to the next entry
 /// for the same file (0 terminates).
-#[repr(C)]
-#[derive(FromBytes, IntoBytes, Immutable, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MetadataFileEntryInfo {
     /// Index into `file_infos`.
     pub file_id:          u32,
     /// Index into `bundle_infos`.
     pub bundle_id:        u32,
-    pub offset_in_bundle: u32,
+    pub offset_in_bundle: u64,
     pub size_in_bundle:   u32,
     /// Index into `entry_infos`; next entry for the same file. 0 = end.
     pub next_entry:       u32,
 }
 
 /// One `.bundle` file referenced by this metadata.
-#[repr(C)]
-#[derive(FromBytes, IntoBytes, Immutable, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MetadataBundleInfo {
     pub string_table_name_offset: u32,
     /// Index into `entry_infos`; start of this bundle's entry group.
     pub first_file_entry:         u32,
     pub num_bundle_entries:       u32,
-    pub data_block_size:          u32,
+    pub data_block_size:          u64,
     pub data_block_offset:        u32,
     pub burst_data_block_size:    u32,
 }
@@ -156,7 +157,7 @@ impl DynamicArray {
     /// consumed (VLQ + payload).
     pub fn parse<T: FromBytes + Clone>(data: &[u8]) -> Result<(Vec<T>, usize), ReadError> {
         let (count, count_len) = read_vlq_i32(data)?;
-        let count = count as usize;
+        let count = nonnegative_size(count, "DynamicArray count")?;
         let item_size = std::mem::size_of::<T>();
         let payload = count_len
             .checked_add(count.checked_mul(item_size).ok_or_else(overflow_read)?)
@@ -191,6 +192,10 @@ impl DynamicArray {
 
 fn overflow_read() -> ReadError {
     ReadError("integer overflow computing DynamicArray payload size".to_string())
+}
+
+fn nonnegative_size(value: i32, field: &str) -> Result<usize, ReadError> {
+    usize::try_from(value).map_err(|_| ReadError(format!("{field} must not be negative: {value}")))
 }
 
 
@@ -246,6 +251,83 @@ impl Default for Metadata {
 }
 
 impl Metadata {
+    /// Create an index for the layout emitted by [`crate::Bundle::write`].
+    /// Bundles must use the requested target format. Duplicate paths form entry chains.
+    pub fn from_bundles(
+        format: crate::BundleFormat,
+        bundles: &[(&CStr, &crate::Bundle<'_>)],
+    ) -> Result<Self, MetadataError> {
+        Self::build_from_bundles(format, bundles, false)
+    }
+
+    /// Index bundles as parsed from existing files, preserving their actual
+    /// payload offsets rather than the layout that reserialization would use.
+    pub fn from_bundle_files(
+        format: crate::BundleFormat,
+        bundles: &[(&CStr, &crate::Bundle<'_>)],
+    ) -> Result<Self, MetadataError> {
+        Self::build_from_bundles(format, bundles, true)
+    }
+
+    fn build_from_bundles(
+        format: crate::BundleFormat,
+        bundles: &[(&CStr, &crate::Bundle<'_>)],
+        existing: bool,
+    ) -> Result<Self, MetadataError> {
+        let mut files: Vec<PendingFile> = Vec::new();
+        let mut file_ids = HashMap::new();
+        let mut pending_bundles = Vec::new();
+        for (bundle_index, (name, bundle)) in bundles.iter().enumerate() {
+            let expected = if format == crate::BundleFormat::Legacy { 3 } else { 5 };
+            if bundle.version() != expected {
+                return Err(ReadError("bundle format does not match metadata target".into()).into());
+            }
+            pending_bundles.push(PendingBundle {
+                name:                  (*name).to_owned(),
+                data_block_offset:     bundle.data_block_offset(),
+                data_block_size:       if existing {
+                    bundle.bundle_size.saturating_sub(u64::from(bundle.data_block_offset()))
+                } else {
+                    bundle.data_block_size_u64()
+                },
+                burst_data_block_size: 0,
+            });
+            for (item, offset) in bundle.items().iter().zip(bundle.compute_offsets_u64()) {
+                let entry = PendingEntry {
+                    bundle_index,
+                    offset_in_bundle: if existing { item.offset() } else { offset },
+                    size_in_bundle: item.zsize(),
+                };
+                if let Some(&file_id) = file_ids.get(item.name()) {
+                    let file: &mut PendingFile = &mut files[file_id];
+                    if file.size_in_bundle != item.zsize()
+                        || file.size_in_memory != item.size()
+                        || file.compression_type != item.compression() as u32
+                    {
+                        return Err(ReadError("duplicate path has incompatible bundle entries".into()).into());
+                    }
+                    file.entries.push(entry);
+                } else {
+                    file_ids.insert(item.name().to_owned(), files.len());
+                    files.push(PendingFile {
+                        path:             item.name().to_owned(),
+                        path_hash:        0,
+                        size_in_bundle:   item.zsize(),
+                        size_in_memory:   item.size(),
+                        compression_type: item.compression() as u32,
+                        buffer_size:      None,
+                        hash:             None,
+                        entries:          vec![entry],
+                    });
+                }
+            }
+        }
+        let mut metadata = build_metadata(files, pending_bundles);
+        metadata.version = if format == crate::BundleFormat::Legacy { 6 } else { 7 };
+        metadata.try_write()?;
+        Ok(metadata)
+    }
+
     /// Construct an empty `Metadata` with the standard index-0 placeholders
     /// (empty string table sentinel, null file/entry/bundle records, root dir).
     pub fn new() -> Self {
@@ -288,12 +370,15 @@ impl Metadata {
             .into());
         }
         let version: u32 = read(&data[4..])?;
+        if !matches!(version, 6 | 7) {
+            return Err(ReadError(format!("unsupported metadata version {version}")).into());
+        }
         let max_size_in_bundle: u32 = read(&data[8..])?;
         let max_size_in_memory: u32 = read(&data[12..])?;
 
         // 2. String table
         let (string_table_size, vlq_len) = read_vlq_i32(&data[16..])?;
-        let string_table_size = string_table_size as usize;
+        let string_table_size = nonnegative_size(string_table_size, "string table size")?;
         let mut position = 16 + vlq_len;
         if data.len() < position + string_table_size {
             return Err(ReadError(format!(
@@ -314,18 +399,65 @@ impl Metadata {
             .collect::<Vec<_>>();
 
         // 4. entry_infos
-        let (entry_infos, consumed) = DynamicArray::parse::<MetadataFileEntryInfo>(&data[position..])?;
+        let entry_width = if version == 7 { 24 } else { 20 };
+        let (entry_records, consumed) = record_slices(&data[position..], entry_width)?;
+        let entry_infos = entry_records
+            .into_iter()
+            .map(|record| {
+                if version == 7 {
+                    Ok(MetadataFileEntryInfo {
+                        offset_in_bundle: read(&record[0..])?,
+                        size_in_bundle:   read(&record[8..])?,
+                        next_entry:       read(&record[12..])?,
+                        file_id:          read(&record[16..])?,
+                        bundle_id:        read(&record[20..])?,
+                    })
+                } else {
+                    Ok(MetadataFileEntryInfo {
+                        file_id:          read(&record[0..])?,
+                        bundle_id:        read(&record[4..])?,
+                        offset_in_bundle: u64::from(read::<u32>(&record[8..])?),
+                        size_in_bundle:   read(&record[12..])?,
+                        next_entry:       read(&record[16..])?,
+                    })
+                }
+            })
+            .collect::<Result<Vec<_>, ReadError>>()?;
         position += consumed;
 
         // 5. bundle_infos
-        let (bundle_infos, consumed) = DynamicArray::parse::<MetadataBundleInfo>(&data[position..])?;
+        let (bundle_records, consumed) = record_slices(&data[position..], 24)?;
+        let bundle_infos = bundle_records
+            .into_iter()
+            .map(|record| {
+                if version == 7 {
+                    Ok(MetadataBundleInfo {
+                        data_block_size:          read(&record[0..])?,
+                        data_block_offset:        read(&record[8..])?,
+                        string_table_name_offset: read(&record[12..])?,
+                        first_file_entry:         read(&record[16..])?,
+                        num_bundle_entries:       read(&record[20..])?,
+                        burst_data_block_size:    0,
+                    })
+                } else {
+                    Ok(MetadataBundleInfo {
+                        string_table_name_offset: read(&record[0..])?,
+                        first_file_entry:         read(&record[4..])?,
+                        num_bundle_entries:       read(&record[8..])?,
+                        data_block_size:          u64::from(read::<u32>(&record[12..])?),
+                        data_block_offset:        read(&record[16..])?,
+                        burst_data_block_size:    read(&record[20..])?,
+                    })
+                }
+            })
+            .collect::<Result<Vec<_>, ReadError>>()?;
         position += consumed;
 
         // 6. buffers (VLQ count + u32 payload)
         let (buffer_count, vlq_len) = read_vlq_i32(&data[position..])?;
         position += vlq_len;
-        let buffer_count = buffer_count as usize;
-        let buffer_bytes = buffer_count * BUFFER_ENTRY_SIZE;
+        let buffer_count = nonnegative_size(buffer_count, "buffer count")?;
+        let buffer_bytes = buffer_count.checked_mul(BUFFER_ENTRY_SIZE).ok_or_else(overflow_read)?;
         if data.len() < position + buffer_bytes {
             return Err(ReadError(format!(
                 "buffers section needs {buffer_bytes} bytes, only {} available",
@@ -370,6 +502,15 @@ impl Metadata {
     /// Encode this metadata to bytes. Round-trips byte-for-byte for the shipped
     /// fixtures.
     pub fn write(&self) -> Vec<u8> {
+        self.try_write()
+            .expect("metadata cannot be represented in its target format")
+    }
+
+    /// Serialize, rejecting unknown versions and legacy integer overflow.
+    pub fn try_write(&self) -> Result<Vec<u8>, MetadataError> {
+        if !matches!(self.version, 6 | 7) {
+            return Err(ReadError(format!("unsupported metadata version {}", self.version)).into());
+        }
         let file_info_records: Vec<MetadataFileInfo> = self.file_infos.iter().map(|(_, fi)| *fi).collect();
 
         let capacity = HEADER_FIXED_SIZE
@@ -396,8 +537,54 @@ impl Metadata {
 
         // Seven arrays in order
         out.extend_from_slice(&DynamicArray::write(&file_info_records));
-        out.extend_from_slice(&DynamicArray::write(&self.entry_infos));
-        out.extend_from_slice(&DynamicArray::write(&self.bundle_infos));
+        out.extend_from_slice(&write_vlq_i32(self.entry_infos.len() as i32));
+        for entry in &self.entry_infos {
+            if self.version == 7 {
+                out.extend_from_slice(&entry.offset_in_bundle.to_le_bytes());
+                for value in [entry.size_in_bundle, entry.next_entry, entry.file_id, entry.bundle_id] {
+                    out.extend_from_slice(&value.to_le_bytes());
+                }
+            } else {
+                let offset = u32::try_from(entry.offset_in_bundle)
+                    .map_err(|_| ReadError("legacy metadata entry offset exceeds u32".into()))?;
+                for value in [
+                    entry.file_id,
+                    entry.bundle_id,
+                    offset,
+                    entry.size_in_bundle,
+                    entry.next_entry,
+                ] {
+                    out.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+        out.extend_from_slice(&write_vlq_i32(self.bundle_infos.len() as i32));
+        for bundle in &self.bundle_infos {
+            if self.version == 7 {
+                out.extend_from_slice(&bundle.data_block_size.to_le_bytes());
+                for value in [
+                    bundle.data_block_offset,
+                    bundle.string_table_name_offset,
+                    bundle.first_file_entry,
+                    bundle.num_bundle_entries,
+                ] {
+                    out.extend_from_slice(&value.to_le_bytes());
+                }
+            } else {
+                let size = u32::try_from(bundle.data_block_size)
+                    .map_err(|_| ReadError("legacy metadata bundle size exceeds u32".into()))?;
+                for value in [
+                    bundle.string_table_name_offset,
+                    bundle.first_file_entry,
+                    bundle.num_bundle_entries,
+                    size,
+                    bundle.data_block_offset,
+                    bundle.burst_data_block_size,
+                ] {
+                    out.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
 
         // buffers: VLQ count + raw u32s
         out.extend_from_slice(&write_vlq_i32(self.buffers.len() as i32));
@@ -409,7 +596,7 @@ impl Metadata {
         out.extend_from_slice(&DynamicArray::write(&self.file_init_infos));
         out.extend_from_slice(&DynamicArray::write(&self.hashes));
 
-        out
+        Ok(out)
     }
 
     // -------- helpers --------
@@ -587,6 +774,21 @@ impl Metadata {
             }
         }
 
-        build_metadata(files, bundles)
+        let mut metadata = build_metadata(files, bundles);
+        metadata.version = sources.iter().map(|source| source.version).max().unwrap_or(6);
+        metadata
     }
+}
+
+fn record_slices(data: &[u8], width: usize) -> Result<(Vec<&[u8]>, usize), ReadError> {
+    let (count, prefix) = read_vlq_i32(data)?;
+    let count = nonnegative_size(count, "record count")?;
+    let end = count
+        .checked_mul(width)
+        .and_then(|size| prefix.checked_add(size))
+        .ok_or_else(overflow_read)?;
+    let payload = data
+        .get(prefix..end)
+        .ok_or_else(|| ReadError("truncated metadata records".into()))?;
+    Ok((payload.chunks_exact(width).collect(), end))
 }

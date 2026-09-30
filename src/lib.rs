@@ -14,7 +14,7 @@ pub(crate) mod build;
 pub(crate) mod hash;
 pub(crate) mod util;
 
-pub use bundle::{Bundle, BundleCompression, BundleItem};
-pub use merge::{MergedMod, ModInput, merge_mods};
+pub use bundle::{Bundle, BundleCompression, BundleFormat, BundleItem};
+pub use merge::{MergedMod, ModInput, merge_mods, merge_mods_for_format};
 pub use metadata::Metadata;
 pub use texture_cache::{TextureCache, TextureCacheEntry};

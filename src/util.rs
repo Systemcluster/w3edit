@@ -22,10 +22,18 @@ pub fn read_vlq_i32(resource: &[u8]) -> Result<(i32, usize), ReadError> {
     let mut shift = 6;
     while next {
         position += 1;
+        if position >= 5 {
+            return Err(ReadError("vlq_i32: encoding exceeds 5 bytes".to_string()));
+        }
         byte = *resource
             .get(position)
             .ok_or_else(|| ReadError("vlq_i32: unexpected end of input".to_string()))?;
-        value |= ((byte & 0x7F) as i32) << shift;
+        let bits = (byte & 0x7F) as i64;
+        let candidate = i64::from(value) | (bits << shift);
+        if candidate > i64::from(i32::MAX) {
+            return Err(ReadError("vlq_i32: value exceeds i32 range".to_string()));
+        }
+        value = candidate as i32;
         next = (byte & 0x80) != 0;
         shift += 7;
     }
@@ -72,4 +80,27 @@ pub fn write_vlq_i32(value: i32) -> Vec<u8> {
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vlq_roundtrips_i32_extremes() {
+        for value in [i32::MIN + 1, -1, 0, 1, i32::MAX] {
+            let encoded = write_vlq_i32(value);
+            assert_eq!(read_vlq_i32(&encoded).unwrap().0, value);
+        }
+    }
+
+    #[test]
+    fn vlq_rejects_overlong_encoding() {
+        assert!(read_vlq_i32(&[0x40, 0x80, 0x80, 0x80, 0x80, 0x00]).is_err());
+    }
+
+    #[test]
+    fn vlq_rejects_out_of_range_value() {
+        assert!(read_vlq_i32(&[0x40, 0x80, 0x80, 0x80, 0x10]).is_err());
+    }
 }

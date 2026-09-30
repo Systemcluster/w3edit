@@ -7,32 +7,8 @@ use w3edit::texture_cache::{TextureCache, TextureCacheEntry};
 
 const PAGE: usize = 4096;
 
-fn align_up(value: usize, align: usize) -> usize {
-    (value + (align - 1)) & !(align - 1)
-}
-
-fn push_string(string_table: &mut Vec<u8>, value: &str) -> i32 {
-    let offset = string_table.len() as i32;
-    string_table.extend_from_slice(value.as_bytes());
-    string_table.push(0);
-    offset
-}
-
-fn push_page(data_pages: &mut Vec<u8>, mip_index: u8, payload: &[u8]) -> u32 {
-    let offset = align_up(data_pages.len(), PAGE);
-    data_pages.resize(offset, 0);
-    data_pages.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    data_pages.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    data_pages.push(mip_index);
-    data_pages.extend_from_slice(payload);
-    offset as u32
-}
-
 fn fixture(prefix: &str) -> TextureCache {
-    let mut string_table = vec![0];
-    let mut data_pages = Vec::new();
-    let mut mip_offsets = Vec::new();
-    let mut entries = Vec::new();
+    let mut cache = TextureCache::new();
 
     for (idx, name) in [
         format!(r"textures\{prefix}\shared.xbm"),
@@ -41,40 +17,28 @@ fn fixture(prefix: &str) -> TextureCache {
     .into_iter()
     .enumerate()
     {
-        let string_table_offset = push_string(&mut string_table, &name);
-        let base_offset = push_page(&mut data_pages, 0, &[idx as u8 + 1, 2, 3]);
-        let mip_offset = push_page(&mut data_pages, 1, &[idx as u8 + 4, 5]);
-        let mip_offset_index = mip_offsets.len() as i32;
-        mip_offsets.push(mip_offset);
-
-        entries.push((CString::new(name).unwrap(), TextureCacheEntry {
-            hash: idx as u32 + 100,
-            string_table_offset,
-            page_offset: base_offset,
-            compressed_size: 3,
-            uncompressed_size: 3,
-            base_alignment: 16,
-            base_width: 64,
-            base_height: 32,
-            mipcount: 2,
-            slice_count: 1,
-            mip_offset_index,
-            num_mip_offsets: 1,
-            time_stamp: 1234 + idx as i64,
-            type1: 1,
-            type2: 2,
-            is_cube: 0,
-            unk1: 9,
-        }));
+        cache
+            .insert(
+                CString::new(name).unwrap(),
+                TextureCacheEntry {
+                    hash: idx as u32 + 100,
+                    base_alignment: 16,
+                    base_width: 64,
+                    base_height: 32,
+                    mipcount: 2,
+                    slice_count: 1,
+                    time_stamp: 1234 + idx as i64,
+                    type1: 1,
+                    type2: 2,
+                    is_cube: 0,
+                    unk1: 9,
+                    ..TextureCacheEntry::default()
+                },
+                &[&[idx as u8 + 1, 2, 3], &[idx as u8 + 4, 5]],
+            )
+            .unwrap();
     }
-
-    TextureCache {
-        version: 3,
-        data_pages,
-        mip_offsets,
-        string_table,
-        entries,
-    }
+    cache
 }
 
 fn names(cache: &TextureCache) -> HashSet<Vec<u8>> {
@@ -86,7 +50,7 @@ fn parse_write_parse_is_stable() {
     let cache = fixture("a");
     let bytes = cache.write();
     let parsed = TextureCache::parse(&bytes).expect("synthetic cache should parse");
-    assert_eq!(parsed.version, 3);
+    assert_eq!(parsed.version, 6);
     assert_eq!(parsed.entries.len(), 2);
     assert_eq!(bytes, parsed.write(), "texture.cache write should be stable");
 }
@@ -142,11 +106,142 @@ fn merge_first_wins_and_repacks_offsets() {
     assert_eq!(merged.entries[0].1.base_width, a.entries[0].1.base_width);
 
     for (_, entry) in &merged.entries {
-        assert_eq!(entry.page_offset as usize % PAGE, 0);
-        assert!(entry.page_offset as usize + 9 + entry.compressed_size as usize <= merged.data_pages.len());
+        assert!(entry.page_offset as usize * PAGE + entry.compressed_size as usize <= merged.data_pages.len());
         assert!(entry.mip_offset_index >= 0);
         let mip_offset = merged.mip_offsets[entry.mip_offset_index as usize];
-        assert_eq!(mip_offset as usize % PAGE, 0);
-        assert!(mip_offset as usize + 9 <= merged.data_pages.len());
+        assert!(mip_offset + 9 < entry.compressed_size);
     }
+}
+
+#[test]
+fn create_both_cache_formats_and_decode_chunks() {
+    use std::io::Read;
+    use w3edit::BundleFormat;
+    for format in [BundleFormat::Legacy, BundleFormat::Remastered] {
+        let mut cache = TextureCache::for_format(format);
+        let descriptor = TextureCacheEntry {
+            base_width: 16,
+            base_height: 16,
+            mipcount: 2,
+            slice_count: 1,
+            ..TextureCacheEntry::default()
+        };
+        cache
+            .insert(c"textures\\test.xbm".into(), descriptor, &[b"base data", b"mip data"])
+            .unwrap();
+        let parsed = TextureCache::parse(&cache.write()).unwrap();
+        assert_eq!(parsed.version, if format == BundleFormat::Legacy { 6 } else { 7 });
+        let entry = parsed.entries[0].1;
+        assert_eq!(entry.mip_offset_count(), 1);
+        assert_eq!(
+            entry.num_mip_offsets >> 16,
+            if format == BundleFormat::Legacy { 0 } else { 1 }
+        );
+        for (index, relative) in [0, parsed.mip_offsets[0]].into_iter().enumerate() {
+            let start = entry.page_offset as usize * PAGE + relative as usize;
+            let size = u32::from_le_bytes(parsed.data_pages[start..start + 4].try_into().unwrap()) as usize;
+            assert_eq!(parsed.data_pages[start + 8], (1 - index) as u8);
+            let mut decoded = Vec::new();
+            flate2::read::ZlibDecoder::new(&parsed.data_pages[start + 9..start + 9 + size])
+                .read_to_end(&mut decoded)
+                .unwrap();
+            assert_eq!(
+                decoded,
+                if index == 0 {
+                    b"base data".as_slice()
+                } else {
+                    b"mip data".as_slice()
+                }
+            );
+        }
+        assert_eq!(TextureCache::merge(&[&parsed]).write(), parsed.write());
+    }
+}
+
+#[test]
+fn real_legacy_cache_merge_preserves_entire_streams() {
+    let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/test/assets/modsbn/texture.cache")).unwrap();
+    let cache = TextureCache::parse(&bytes).unwrap();
+    let merged = TextureCache::merge(&[&cache]);
+    for ((_, source), (_, target)) in cache.entries.iter().zip(&merged.entries) {
+        let source_start = source.page_offset as usize * PAGE;
+        let target_start = target.page_offset as usize * PAGE;
+        let size = source.compressed_size as usize;
+        assert_eq!(
+            &cache.data_pages[source_start..source_start + size],
+            &merged.data_pages[target_start..target_start + size]
+        );
+        let source_mips = source.mip_offset_index as usize;
+        let target_mips = target.mip_offset_index as usize;
+        assert_eq!(
+            &cache.mip_offsets[source_mips..source_mips + source.mip_offset_count()],
+            &merged.mip_offsets[target_mips..target_mips + target.mip_offset_count()]
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires W3_GAME_DIR pointing at a local game installation"]
+fn installed_remastered_texture_creation() {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::path::PathBuf;
+    use w3edit::BundleFormat;
+
+    let root = PathBuf::from(std::env::var_os("W3_GAME_DIR").expect("set W3_GAME_DIR"));
+    let mut file = std::fs::File::open(root.join("content/content0/texture.cache")).unwrap();
+    file.seek(SeekFrom::End(-32)).unwrap();
+    let mut footer = [0u8; 32];
+    file.read_exact(&mut footer).unwrap();
+    let entries = u32::from_le_bytes(footer[12..16].try_into().unwrap()) as u64;
+    let strings = u32::from_le_bytes(footer[16..20].try_into().unwrap()) as u64;
+    let mips = u32::from_le_bytes(footer[20..24].try_into().unwrap()) as u64;
+    let table_size = entries * 52 + strings + mips * 4 + 32;
+    file.seek(SeekFrom::End(-(table_size as i64))).unwrap();
+    let mut tables = Vec::new();
+    file.read_to_end(&mut tables).unwrap();
+    let source = TextureCache::parse(&tables).unwrap();
+    assert_eq!(source.version, 7);
+    let mut created = TextureCache::for_format(BundleFormat::Remastered);
+    for (name, descriptor) in source.entries.iter().take(2) {
+        let mut compressed = vec![0; descriptor.compressed_size as usize];
+        file.seek(SeekFrom::Start(u64::from(descriptor.page_offset) * 4096))
+            .unwrap();
+        file.read_exact(&mut compressed).unwrap();
+        let first = descriptor.mip_offset_index as usize;
+        let relative_offsets = std::iter::once(0).chain(
+            source.mip_offsets[first..first + descriptor.mip_offset_count()]
+                .iter()
+                .copied(),
+        );
+        let mut chunks = Vec::new();
+        for relative in relative_offsets {
+            let start = relative as usize;
+            let size = u32::from_le_bytes(compressed[start..start + 4].try_into().unwrap()) as usize;
+            let mut chunk = Vec::new();
+            flate2::read::ZlibDecoder::new(&compressed[start + 9..start + 9 + size])
+                .read_to_end(&mut chunk)
+                .unwrap();
+            chunks.push(chunk);
+        }
+        assert_eq!(
+            chunks.iter().map(Vec::len).sum::<usize>(),
+            descriptor.uncompressed_size as usize
+        );
+        let chunk_refs: Vec<_> = chunks.iter().map(Vec::as_slice).collect();
+        created.insert(name.clone(), *descriptor, &chunk_refs).unwrap();
+        let output = created.entries.last().unwrap().1;
+        assert_eq!(output.num_mip_offsets, descriptor.num_mip_offsets);
+        let mut start = output.page_offset as usize * PAGE;
+        for expected in &chunks {
+            let size = u32::from_le_bytes(created.data_pages[start..start + 4].try_into().unwrap()) as usize;
+            let mut decoded = Vec::new();
+            flate2::read::ZlibDecoder::new(&created.data_pages[start + 9..start + 9 + size])
+                .read_to_end(&mut decoded)
+                .unwrap();
+            assert_eq!(&decoded, expected);
+            start += 9 + size;
+        }
+    }
+    assert_eq!(created, TextureCache::parse(&created.write()).unwrap());
+    assert_eq!(created.write(), TextureCache::merge(&[&created]).write());
 }
