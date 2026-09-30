@@ -49,6 +49,31 @@ not generally byte-identical to the original container.
 
 ## Installation
 
+### Release Binaries
+
+Download an archive for your platform from the
+[snapshot release](https://github.com/Systemcluster/w3edit/releases/tag/snapshot)
+and extract it. macOS builds are available for Apple Silicon (`aarch64`) and
+Intel (`x86_64`).
+
+The macOS snapshots are not Developer ID-signed or notarized. Browser downloads
+can be quarantined, causing macOS to report that Apple could not verify `w3edit`
+is free of malware. If you trust the release source, run these commands from the
+extracted directory to remove quarantine from this executable only:
+
+```sh
+xattr -d com.apple.quarantine ./w3edit
+./w3edit --version
+```
+
+If `xattr` reports that the attribute does not exist, no removal is needed.
+Alternatively, after attempting to run the executable, approve it under
+**System Settings > Privacy & Security > Open Anyway**. Do not disable Gatekeeper
+globally. This approval is local to your copy and may be needed for each new
+download; it does not sign or notarize the release.
+
+### Build From Source
+
 Build from a checkout with Rust and Cargo installed. A C compiler is also needed
 for the native LZ4 dependency.
 

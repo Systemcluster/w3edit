@@ -1,0 +1,120 @@
+name: Test & Snapshot Release
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: full
+
+jobs:
+  build:
+    name: Test & Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+        with:
+          show-progress: false
+
+      - name: Set up Rust toolchain
+        uses: Systemcluster/actions@setup-rust-v0
+        with:
+          channel: stable
+          targets: ${{ matrix.target }}
+          components: clippy
+          cache-key-job: true
+
+      - name: Check clippy
+        run: cargo clippy --all-targets --all-features --target ${{ matrix.target }}
+
+      - name: Test all features
+        run: cargo test --all-features --target ${{ matrix.target }}
+
+      - name: Test library without default features
+        run: cargo test --no-default-features --target ${{ matrix.target }}
+
+      - name: Build release
+        run: cargo build --release --all-features --target ${{ matrix.target }}
+
+      - name: Check release executable
+        shell: bash
+        run: target/${{ matrix.target }}/release/w3edit${{ runner.os == 'Windows' && '.exe' || '' }} --version
+
+      - name: Pack Unix release
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          tar -czf dist/w3edit-${{ matrix.target }}.tar.gz LICENSE README.md -C target/${{ matrix.target }}/release w3edit
+
+      - name: Pack Windows release
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force
+          Compress-Archive -Path target/${{ matrix.target }}/release/w3edit.exe, LICENSE, README.md -DestinationPath dist/w3edit-${{ matrix.target }}.zip
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: w3edit-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish Snapshot
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+        with:
+          show-progress: false
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: w3edit-*
+          path: dist
+          merge-multiple: true
+
+      - name: Upload snapshot release
+        uses: Systemcluster/actions@release-github-v0
+        with:
+          tag: snapshot
+          name: Snapshot
+          prerelease: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
