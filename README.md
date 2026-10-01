@@ -6,7 +6,7 @@ Implements a subset of features from `wcc_lite` from the official The Witcher 3 
 
 ## Status
 
-The library and CLI support creating, inspecting, unpacking, and merging Witcher 3
+The library and CLI support creating, inspecting, unpacking, converting, and merging Witcher 3
 mod containers in Legacy and Remastered formats. Bundle packing
 accepts already-cooked files; cache creation accepts already-cooked GPU texture
 chunks. Asset cooking, image conversion, and DDS extraction are not implemented.
@@ -28,6 +28,8 @@ official mod toolchain.
 - Merges multiple mods into a single `(bundle, metadata)` pair with first-wins
   priority and self-consistent cross-references
 - Creates, reads, writes, and merges version-6 and version-7 `texture.cache` files
+- Upgrades or downgrades bundles, metadata indexes, and texture caches between
+  Legacy and Remastered container layouts without recompressing payloads
 - Provides a `w3edit` CLI for inspecting containers, unpacking bundles, and
   merging a bundle, metadata index, and optional texture cache from each input
 
@@ -117,6 +119,38 @@ w3edit metadata list path/to/metadata.store
 w3edit texture list path/to/texture.cache
 ```
 
+Upgrade or downgrade an existing container with an explicit target:
+
+```sh
+w3edit convert legacy/blob0.bundle remastered/blob0.bundle --format remastered
+w3edit convert remastered/texture.cache legacy/texture.cache --format legacy
+w3edit convert input/metadata.store output/metadata.store --format remastered
+```
+
+`convert` detects the file type by signature, not filename. It accepts bundle
+versions 3/5 and metadata/cache versions 6/7. The output parent directory must
+exist; replacing an existing file requires `--force`. The library equivalent is
+`w3edit::convert(data: &[u8], format: BundleFormat) -> Result<Vec<u8>, ConversionError>`.
+
+Conversion changes container layouts, not cooked resources, scripts, or texture
+formats, and does not establish compatibility with the target game. Compressed
+payload bytes are preserved; fields absent from the target layout are lost
+(for example, legacy bundle timestamps and metadata burst sizes when upgrading).
+Downgrades that exceed legacy integer limits fail instead of truncating values.
+Even same-target bundle conversion rebuilds the layout.
+
+Converting metadata alone preserves its recorded bundle offsets; it does not
+convert or reindex the referenced bundles. After converting bundles, regenerate
+their metadata, for example:
+
+```sh
+w3edit metadata create remastered/ remastered/metadata.store --format remastered --force
+```
+
+As with all metadata creation, this does not reconstruct resource-specific hashes
+or buffer information. To preserve those fields for a single-bundle mod, use
+`merge` with one input directory and an explicit `--format` instead.
+
 Create containers with an explicit target (the default is `legacy`):
 
 ```sh
@@ -197,7 +231,7 @@ cooked assets.
 
 ### Output Safety and Limits
 
-Creation, extraction, and merge refuse to replace existing files unless `--force` is
+Creation, conversion, extraction, and merge refuse to replace existing files unless `--force` is
 passed. Existing directories are not cleared, and failures can leave partial
 output. Use a fresh output directory, separate from your inputs, and keep backups.
 
@@ -265,7 +299,7 @@ cargo test
 cargo test --no-default-features
 ```
 
-The suite covers creation, parsing, serialization, merging, and CLI workflows,
+The suite covers creation, parsing, serialization, conversion, merging, and CLI workflows,
 using legacy fixtures and synthetic legacy/remastered cases. CLI tests run only
 with the `cli` feature enabled (the default). Tests and fixtures are not included
 in the Cargo publication package.

@@ -10,6 +10,78 @@ fn command() -> Command {
 }
 
 #[test]
+fn convert_containers_in_both_directions_with_output_protection() {
+    use std::fs;
+    use w3edit::{Bundle, BundleCompression, BundleFormat, BundleItem, Metadata, TextureCache, convert};
+
+    let root = std::env::temp_dir().join(format!("w3edit-convert-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let bundle = Bundle::from_items(BundleFormat::Legacy, vec![
+        BundleItem::new(c"file.bin".into(), b"payload", BundleCompression::Zlib).unwrap(),
+    ]);
+    let metadata = Metadata::from_bundles(BundleFormat::Legacy, &[(c"blob0.bundle", &bundle)]).unwrap();
+    for (name, original) in [
+        ("bundle", bundle.write()),
+        ("metadata", metadata.write()),
+        ("texture", TextureCache::new().write()),
+    ] {
+        let input = root.join(format!("{name}.input"));
+        let output_path = root.join(format!("{name}.output"));
+        fs::write(&input, &original).unwrap();
+        let output = command()
+            .arg("convert")
+            .arg(&input)
+            .arg(&output_path)
+            .args(["--format", "remastered"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(fs::read(&input).unwrap(), original);
+        assert_eq!(
+            fs::read(&output_path).unwrap(),
+            convert(&original, BundleFormat::Remastered).unwrap()
+        );
+        let output = command()
+            .arg("convert")
+            .arg(&output_path)
+            .arg(&input)
+            .args(["--format", "legacy"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert_eq!(fs::read(&input).unwrap(), original);
+        let output = command()
+            .arg("convert")
+            .arg(&output_path)
+            .arg(&input)
+            .args(["--format", "legacy", "--force"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(fs::read(&input).unwrap(), original);
+    }
+    let input = root.join("invalid");
+    let output_path = root.join("protected");
+    fs::write(&output_path, b"keep me").unwrap();
+    for invalid in [b"".as_slice(), b"unknown", b"POTATO70", b"\x03VTM", b"HCXT\x06\0\0\0"] {
+        fs::write(&input, invalid).unwrap();
+        let output = command()
+            .arg("convert")
+            .arg(&input)
+            .arg(&output_path)
+            .args(["--format", "legacy", "--force"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(fs::read(&output_path).unwrap(), b"keep me");
+    }
+    let output = command().arg("convert").arg(&input).arg(&output_path).output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8(output.stderr).unwrap().contains("--format"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn create_bundle_store_and_cache_for_both_games() {
     use std::fs;
     use w3edit::{Bundle, Metadata, TextureCache};
@@ -132,7 +204,7 @@ fn help_lists_commands() {
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    for name in ["bundle", "metadata", "texture", "merge"] {
+    for name in ["bundle", "metadata", "texture", "merge", "convert"] {
         assert!(stdout.contains(name), "missing command {name}: {stdout}");
     }
 }

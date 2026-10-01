@@ -24,3 +24,15 @@ pub enum TextureCacheError {
     #[error("invalid texture cache: {0}")]
     InvalidBytes(#[from] ReadError),
 }
+
+#[derive(Error, Debug, Clone)]
+pub enum ConversionError {
+    #[error("unrecognized container; expected a bundle, metadata.store, or texture.cache")]
+    UnknownContainer,
+    #[error(transparent)]
+    Bundle(#[from] BundleError),
+    #[error(transparent)]
+    Metadata(#[from] MetadataError),
+    #[error(transparent)]
+    TextureCache(#[from] TextureCacheError),
+}

@@ -7,6 +7,30 @@ use std::path::PathBuf;
 use w3edit::metadata::Metadata;
 
 #[test]
+fn convert_metadata_preserves_records_and_rejects_legacy_overflow() {
+    use w3edit::{BundleFormat, convert};
+
+    let original = parse("modtest");
+    let upgraded = Metadata::parse(&convert(&original.write(), BundleFormat::Remastered).unwrap()).unwrap();
+    assert_eq!(upgraded.version, 7);
+    assert_eq!(upgraded.entry_infos, original.entry_infos);
+    assert_eq!(upgraded.file_infos, original.file_infos);
+    assert_eq!(upgraded.buffers, original.buffers);
+    assert_eq!(upgraded.hashes, original.hashes);
+    let downgraded = Metadata::parse(&convert(&upgraded.write(), BundleFormat::Legacy).unwrap()).unwrap();
+    assert_eq!(downgraded.version, 6);
+    assert_eq!(downgraded.entry_infos, original.entry_infos);
+    assert_eq!(downgraded.file_infos, original.file_infos);
+
+    let mut wide = upgraded;
+    wide.entry_infos[1].offset_in_bundle = u64::from(u32::MAX) + 1;
+    assert!(convert(&wide.write(), BundleFormat::Legacy).is_err());
+    wide.entry_infos[1].offset_in_bundle = 0;
+    wide.bundle_infos[1].data_block_size = u64::from(u32::MAX) + 1;
+    assert!(convert(&wide.write(), BundleFormat::Legacy).is_err());
+}
+
+#[test]
 fn create_metadata_for_both_formats() {
     use w3edit::{Bundle, BundleCompression, BundleFormat, BundleItem};
     for format in [BundleFormat::Legacy, BundleFormat::Remastered] {

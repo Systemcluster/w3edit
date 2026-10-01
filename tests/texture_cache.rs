@@ -46,6 +46,35 @@ fn names(cache: &TextureCache) -> HashSet<Vec<u8>> {
 }
 
 #[test]
+fn convert_texture_cache_preserves_streams_and_updates_flags() {
+    use w3edit::{BundleFormat, convert};
+
+    let original = fixture("convert");
+    let upgraded_bytes = convert(&original.write(), BundleFormat::Remastered).unwrap();
+    let upgraded = TextureCache::parse(&upgraded_bytes).unwrap();
+    assert_eq!(upgraded.version, 7);
+    assert_eq!(upgraded.data_pages, original.data_pages);
+    assert_eq!(upgraded.mip_offsets, original.mip_offsets);
+    assert_eq!(upgraded.string_table, original.string_table);
+    for ((name, entry), (original_name, original_entry)) in upgraded.entries.iter().zip(&original.entries) {
+        assert_eq!(name, original_name);
+        let mut expected = *original_entry;
+        expected.num_mip_offsets |= 1 << 16;
+        assert_eq!(*entry, expected);
+    }
+    assert_eq!(
+        convert(&upgraded_bytes, BundleFormat::Remastered).unwrap(),
+        upgraded_bytes
+    );
+    let downgraded = TextureCache::parse(&convert(&upgraded_bytes, BundleFormat::Legacy).unwrap()).unwrap();
+    assert_eq!(downgraded, original);
+
+    let mut unsupported = original;
+    unsupported.version = 8;
+    assert!(convert(&unsupported.write(), BundleFormat::Legacy).is_err());
+}
+
+#[test]
 fn parse_write_parse_is_stable() {
     let cache = fixture("a");
     let bytes = cache.write();

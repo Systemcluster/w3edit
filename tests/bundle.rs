@@ -8,6 +8,41 @@ use std::path::PathBuf;
 use w3edit::bundle::{Bundle, BundleCompression};
 
 #[test]
+fn convert_bundle_preserves_compressed_payloads() {
+    use w3edit::{BundleFormat, BundleItem, convert};
+
+    let items = [
+        BundleCompression::None,
+        BundleCompression::Zlib,
+        BundleCompression::Snappy,
+        BundleCompression::Lz4,
+        BundleCompression::Lz4hc,
+    ]
+    .into_iter()
+    .map(|codec| BundleItem::new(CString::new(format!("{codec:?}.bin")).unwrap(), b"payload", codec).unwrap())
+    .collect();
+    let original = Bundle::from_items(BundleFormat::Legacy, items);
+    let mut bytes = original.write();
+    for (format, version) in [
+        (BundleFormat::Remastered, 5),
+        (BundleFormat::Legacy, 3),
+        (BundleFormat::Legacy, 3),
+    ] {
+        bytes = convert(&bytes, format).unwrap();
+        let parsed = Bundle::parse(bytes.as_slice()).unwrap();
+        assert_eq!(parsed.version(), version);
+        assert_eq!(parsed.items().len(), original.items().len());
+        for (actual, expected) in parsed.items().iter().zip(original.items()) {
+            assert_eq!(actual.name(), expected.name());
+            assert_eq!(actual.raw(), expected.raw());
+            assert_eq!(actual.compression(), expected.compression());
+            assert_eq!(actual.crc(), expected.crc());
+            assert_eq!(actual.decompressed().unwrap(), b"payload");
+        }
+    }
+}
+
+#[test]
 fn create_both_bundle_formats_with_supported_codecs() {
     use w3edit::{BundleFormat, BundleItem};
     for format in [BundleFormat::Legacy, BundleFormat::Remastered] {

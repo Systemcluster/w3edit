@@ -30,6 +30,19 @@ enum Command {
     Texture(TextureArgs),
     /// Merge mod directories in first-wins priority order.
     Merge(MergeArgs),
+    /// Upgrade or downgrade a container without converting cooked assets.
+    Convert {
+        /// Bundle, metadata.store, or texture.cache file (detected by signature).
+        input:  PathBuf,
+        /// Destination file. Rebuild metadata after converting its bundles.
+        output: PathBuf,
+        /// Target game format.
+        #[arg(long, value_enum)]
+        format: BundleFormat,
+        /// Replace an existing output file.
+        #[arg(long)]
+        force:  bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -203,6 +216,18 @@ fn run_command(command: Command) -> Result<()> {
         Command::Metadata(args) => run_metadata(args.command),
         Command::Texture(args) => run_texture(args.command),
         Command::Merge(args) => run_merge(args),
+        Command::Convert {
+            input,
+            output,
+            format,
+            force,
+        } => {
+            let data = fs::read(&input).map_err(|error| contextual_io("read container", &input, error))?;
+            let converted = w3edit::convert(&data, format)?;
+            write_output(&output, &converted, force)?;
+            println!("Converted {} to {:?}: {}", input.display(), format, output.display());
+            Ok(())
+        },
     }
 }
 
