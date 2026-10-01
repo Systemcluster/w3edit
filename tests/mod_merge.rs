@@ -9,6 +9,102 @@ use std::path::PathBuf;
 use w3edit::{Bundle, Metadata, ModInput, TextureCache, TextureCacheEntry};
 
 #[test]
+fn winning_payload_does_not_inherit_losing_metadata() {
+    use w3edit::{BundleCompression, BundleFormat, BundleItem};
+
+    let winner = Bundle::from_items(BundleFormat::Legacy, vec![
+        BundleItem::new(c"shared.bin".into(), b"winner", BundleCompression::None).unwrap(),
+    ]);
+    let loser = Bundle::from_items(BundleFormat::Legacy, vec![
+        BundleItem::new(c"shared.bin".into(), b"different payload", BundleCompression::Zlib).unwrap(),
+    ]);
+    let missing_metadata = Metadata::new();
+    let losing_metadata = Metadata::from_bundles(BundleFormat::Legacy, &[(c"blob0.bundle", &loser)]).unwrap();
+    let merged = w3edit::merge_mods(
+        &[
+            ModInput::new(&winner, &missing_metadata),
+            ModInput::new(&loser, &losing_metadata),
+        ],
+        c"blob0.bundle",
+    );
+    assert_eq!(merged.bundle.items()[0].decompressed().unwrap(), b"winner");
+    assert_eq!(merged.metadata.file_infos[1].1.size_in_memory, 6);
+    assert_eq!(merged.metadata.file_infos[1].1.compression_type, 0);
+}
+
+#[test]
+fn merge_options_select_conflicts_and_per_file_winners() {
+    use w3edit::{BundleCompression, BundleFormat, BundleItem, MergeOptions, merge_mods_with_options};
+
+    let first = Bundle::from_items(BundleFormat::Legacy, vec![
+        BundleItem::new(c"shared.bin".into(), b"first", BundleCompression::None).unwrap(),
+        BundleItem::new(c"first.bin".into(), b"unique", BundleCompression::None).unwrap(),
+    ]);
+    let second = Bundle::from_items(BundleFormat::Remastered, vec![
+        BundleItem::new(c"SHARED.bin".into(), b"second choice", BundleCompression::Zlib).unwrap(),
+        BundleItem::new(c"second.bin".into(), b"unique", BundleCompression::None).unwrap(),
+    ]);
+    let first_metadata = Metadata::from_bundles(BundleFormat::Legacy, &[(c"blob0.bundle", &first)]).unwrap();
+    let second_metadata = Metadata::from_bundles(BundleFormat::Remastered, &[(c"blob0.bundle", &second)]).unwrap();
+    let first_cache = texture_cache_fixture(&[(r"textures\shared.xbm", 11), (r"textures\first.xbm", 12)]);
+    let second_cache = texture_cache_fixture(&[(r"textures\shared.xbm", 21), (r"textures\second.xbm", 22)]);
+    let inputs = [
+        ModInput::new(&first, &first_metadata).with_texture_cache(&first_cache),
+        ModInput::new(&second, &second_metadata).with_texture_cache(&second_cache),
+    ];
+    let mut options = MergeOptions {
+        conflicts_only: true,
+        preferred_sources: [(c"shared.bin".into(), 1), (c"textures/shared.xbm".into(), 1)].into(),
+        ..MergeOptions::default()
+    };
+    for format in [BundleFormat::Legacy, BundleFormat::Remastered] {
+        options.format = Some(format);
+        let merged = merge_mods_with_options(&inputs, c"merged.bundle", &options).unwrap();
+        let bundle = Bundle::parse(merged.bundle.write()).unwrap();
+        let metadata = Metadata::parse(&merged.metadata.write()).unwrap();
+        assert_eq!(bundle.items().len(), 1);
+        assert_eq!(bundle.items()[0].decompressed().unwrap(), b"second choice");
+        assert_eq!(metadata.file_infos.len(), 2);
+        assert_eq!(metadata.file_infos[1].1.size_in_memory, 13);
+        assert_eq!(metadata.file_infos[1].1.compression_type, 1);
+        assert_eq!(metadata.entry_infos[1].offset_in_bundle, bundle.items()[0].offset());
+        let cache = merged.texture_cache.unwrap();
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.entries[0].1.hash, 21);
+        assert_eq!(cache.write(), TextureCache::parse(&cache.write()).unwrap().write());
+        assert_eq!(cache.version, metadata.version);
+    }
+    options.conflicts_only = false;
+    let merged = merge_mods_with_options(&inputs, c"merged.bundle", &options).unwrap();
+    assert_eq!(merged.bundle.items().len(), 3);
+    assert_eq!(merged.texture_cache.unwrap().entries.len(), 3);
+    options.preferred_sources.insert(c"missing.bin".into(), 0);
+    assert!(merge_mods_with_options(&inputs, c"merged.bundle", &options).is_err());
+}
+
+#[test]
+fn conflicts_require_distinct_mods_and_omit_unique_textures() {
+    use w3edit::{BundleCompression, BundleFormat, BundleItem, MergeOptions, merge_mods_with_options};
+
+    let item = BundleItem::new(c"repeated.bin".into(), b"same", BundleCompression::None).unwrap();
+    let bundle = Bundle::from_items(BundleFormat::Legacy, vec![item.clone(), item]);
+    let metadata = Metadata::new();
+    let cache = texture_cache_fixture(&[(r"textures\unique.xbm", 1)]);
+    let options = MergeOptions {
+        conflicts_only: true,
+        ..MergeOptions::default()
+    };
+    for inputs in [vec![], vec![
+        ModInput::new(&bundle, &metadata).with_texture_cache(&cache),
+    ]] {
+        let merged = merge_mods_with_options(&inputs, c"merged.bundle", &options).unwrap();
+        assert!(merged.bundle.items().is_empty());
+        assert_eq!(merged.metadata.file_infos.len(), 1);
+        assert!(merged.texture_cache.is_none());
+    }
+}
+
+#[test]
 fn explicit_merge_target_controls_all_three_outputs() {
     use w3edit::{BundleFormat, merge_mods_for_format};
     let (_, bundle, metadata) = parse_mod("modsbn");

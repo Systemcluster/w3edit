@@ -309,6 +309,13 @@ impl TextureCache {
 
     /// Union multiple caches with first-wins priority by string-table name.
     pub fn merge(sources: &[&TextureCache]) -> TextureCache {
+        Self::merge_selected(sources, |_, _| true)
+    }
+
+    pub(crate) fn merge_selected(
+        sources: &[&TextureCache],
+        mut include: impl FnMut(usize, &CStr) -> bool,
+    ) -> TextureCache {
         if sources.is_empty() {
             return TextureCache::new();
         }
@@ -321,9 +328,9 @@ impl TextureCache {
             entries:      Vec::new(),
         };
         let mut seen = HashSet::new();
-        for source in sources {
+        for (source_index, source) in sources.iter().enumerate() {
             for (name, entry) in &source.entries {
-                if !seen.insert(name.clone()) {
+                if !include(source_index, name) || !seen.insert(name.clone()) {
                     continue;
                 }
 

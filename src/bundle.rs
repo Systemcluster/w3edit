@@ -673,13 +673,17 @@ impl<'a> Bundle<'a> {
     /// bundle; when the input is empty, an empty bundle is returned.
     /// If any input uses version 5, the output uses version 5 as well.
     pub fn merge(bundles: &[&Bundle<'a>]) -> Bundle<'a> {
+        Self::merge_selected(bundles, |_, _| true)
+    }
+
+    pub(crate) fn merge_selected(bundles: &[&Bundle<'a>], mut include: impl FnMut(usize, &CStr) -> bool) -> Bundle<'a> {
         use std::collections::HashSet;
 
         let mut items: Vec<BundleItem<'a>> = Vec::new();
         let mut seen: HashSet<CString> = HashSet::new();
-        for bundle in bundles {
+        for (source_index, bundle) in bundles.iter().enumerate() {
             for item in &bundle.items {
-                if seen.insert(item.name.clone()) {
+                if include(source_index, &item.name) && seen.insert(item.name.clone()) {
                     items.push(item.clone());
                 }
             }

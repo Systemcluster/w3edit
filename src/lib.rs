@@ -16,7 +16,9 @@ pub(crate) mod util;
 
 pub use bundle::{Bundle, BundleCompression, BundleFormat, BundleItem};
 pub use errors::ConversionError;
-pub use merge::{MergedMod, ModInput, merge_mods, merge_mods_for_format};
+pub use merge::{
+    MergeError, MergeOptions, MergedMod, ModInput, merge_mods, merge_mods_for_format, merge_mods_with_options,
+};
 pub use metadata::Metadata;
 pub use texture_cache::{TextureCache, TextureCacheEntry};
 

@@ -51,210 +51,291 @@ not generally byte-identical to the original container.
 
 ## Installation
 
-### Release Binaries
+Prebuilt binaries for Linux, Windows and macOS are available on the
+[snapshot release](https://github.com/Systemcluster/w3edit/releases/tag/snapshot).
+Download the archive for your platform and extract it.
 
-Download an archive for your platform from the
-[snapshot release](https://github.com/Systemcluster/w3edit/releases/tag/snapshot)
-and extract it. macOS builds are available for Apple Silicon (`aarch64`) and
-Intel (`x86_64`).
+<details>
+<summary>Running on macOS</summary>
 
-The macOS snapshots are not Developer ID-signed or notarized. Browser downloads
-can be quarantined, causing macOS to report that Apple could not verify `w3edit`
-is free of malware. If you trust the release source, run these commands from the
-extracted directory to remove quarantine from this executable only:
+The macOS builds are not signed or notarized, so macOS may refuse to run `w3edit`
+after downloading it through a browser. If you trust the release source, remove
+the quarantine attribute from the executable:
 
 ```sh
 xattr -d com.apple.quarantine ./w3edit
-./w3edit --version
 ```
 
-If `xattr` reports that the attribute does not exist, no removal is needed.
-Alternatively, after attempting to run the executable, approve it under
-**System Settings > Privacy & Security > Open Anyway**. Do not disable Gatekeeper
-globally. This approval is local to your copy and may be needed for each new
-download; it does not sign or notarize the release.
+Alternatively, try to run it once and then approve it under
+**System Settings > Privacy & Security > Open Anyway**.
 
-### Build From Source
+</details>
 
-Build from a checkout with Rust and Cargo installed. A C compiler is also needed
-for the native LZ4 dependency.
+### Building From Source
+
+Building requires a Rust toolchain and a C compiler for the native LZ4 dependency.
 
 ```sh
 git clone https://github.com/Systemcluster/w3edit.git
 cd w3edit
-```
-
-Install the CLI into Cargo's binary directory (normally `~/.cargo/bin`):
-
-```sh
 cargo install --path .
 ```
 
-Ensure that directory is on your `PATH`. Alternatively, build without installing:
+This installs `w3edit` into Cargo's binary directory, usually `~/.cargo/bin`.
+To build without installing, run `cargo build --release` and use
+`./target/release/w3edit` instead.
+
+## Usage
+
+Set `W3_DIR` to the game installation directory. For example, a default Steam
+installation on macOS may use:
 
 ```sh
-cargo build --release
-./target/release/w3edit --help
+export W3_DIR="$HOME/Library/Application Support/Steam/steamapps/common/The Witcher 3"
+w3edit metadata list "$W3_DIR/mods/modExample"
+w3edit bundle unpack "$W3_DIR/mods/modExample" build/modExample-unpacked/
 ```
 
-The CLI is enabled by default. The examples below use the installed `w3edit`
-command; substitute `./target/release/w3edit` when using a local build.
+Replace `modExample` with the installed mod's directory name. Container-based
+mods normally keep `metadata.store`, one or more `.bundle` files, and an optional
+`texture.cache` directly in `mods/<mod-name>/content/`.
 
-## CLI
+Run `w3edit --help` or `w3edit <command> --help` for all commands and options.
+Commands that create containers take `--format legacy` or `--format remastered`.
+Mod-directory inputs accept either a mod root or its `content/` directory.
+`merge` and directory-to-directory `convert` take an output mod root and create
+`content/` automatically; an explicit output ending in `content/` is used directly.
 
-Inspect or unpack a bundle:
+Container commands also accept mod roots: `bundle pack`, `metadata create`, and
+`texture create` write `content/blob0.bundle`, `content/metadata.store`, and
+`content/texture.cache`, respectively. For container outputs, an existing directory
+or a new path without an extension means a mod root. An existing file or a new
+path with an extension means an explicit file; its parent directory must exist.
+Create a directory first when using a new mod name containing a dot.
+
+The `list` commands and `bundle unpack` accept an existing mod root or content
+directory in place of a container file. Bundle commands use `blob0.bundle` for
+directory inputs; pass an explicit file to select another bundle. `bundle pack`
+and `metadata create` resolve input mod roots to `content/` before computing
+relative paths. `bundle unpack` still writes raw extracted files directly into
+its destination, not into an added `content/` directory.
+
+> [!WARNING]
+> w3edit only replaces existing files with `--force`, but doesn't clear existing
+> directories, and a failed command can leave partial output behind. Use a fresh
+> output directory separate from your inputs, and keep backups of your mods.
+
+### Bundles
 
 ```sh
-w3edit bundle list path/to/blob0.bundle
-w3edit bundle unpack path/to/blob0.bundle path/to/output
+w3edit bundle list "$W3_DIR/mods/modExample"
+w3edit bundle unpack "$W3_DIR/mods/modExample" build/modExample-unpacked/
+w3edit bundle pack cooked/ build/modMyMod --format remastered --compression zlib
 ```
 
-Omit the unpack output path to create `<bundle-name>.unpacked` beside the bundle
-(for example, `blob0.bundle` becomes `blob0.unpacked`).
+Unpacking extracts all files into the given directory, or into `blob0.unpacked`
+beside the bundle when no output is given.
 
-Inspect companion indexes:
+Packing recursively includes all files in the resolved input directory and compresses
+them with `zlib` by default, or with `none`, `snappy`, `lz4` or `lz4hc`.
+Files are packed as they are, so they need to be already cooked for the
+target game version.
+
+<details>
+<summary>Notes</summary>
+
+- <sup>Stored paths are relative to the input directory with backslash separators.
+Names have to be ISO-8859-1 encodable and at most 255 bytes long, and symlinks are rejected.</sup>
+- <sup>Keep the output bundle outside of the input directory, otherwise a previous
+output will be packed into the new bundle.</sup>
+- <sup>Unpacking rejects absolute and parent-traversal paths, but follows existing
+symlinks in the output directory.</sup>
+
+</details>
+
+### Metadata
 
 ```sh
-w3edit metadata list path/to/metadata.store
-w3edit texture list path/to/texture.cache
+w3edit metadata list "$W3_DIR/mods/modExample"
+w3edit metadata create build/modMyMod build/modMyMod --format remastered
 ```
 
-Upgrade or downgrade an existing container with an explicit target:
+Metadata creation recursively indexes all `.bundle` files in the resolved content
+directory using their on-disk offsets. Bundle names are relative to that directory,
+without an extra `content/` prefix. All bundles have to match the selected format.
+
+The index is built from the bundle records, not from the cooked resources inside
+them, so resource-specific hashes and buffer information are not reconstructed.
+To keep them for an existing mod, use [`merge`](#merging) with a single input instead.
+
+### Texture Caches
 
 ```sh
-w3edit convert legacy/blob0.bundle remastered/blob0.bundle --format remastered
-w3edit convert remastered/texture.cache legacy/texture.cache --format legacy
-w3edit convert input/metadata.store output/metadata.store --format remastered
+w3edit texture list "$W3_DIR/mods/modExample"
+w3edit texture create modMyMod-textures.json build/modMyMod --format remastered
 ```
 
-`convert` detects the file type by signature, not filename. It accepts bundle
-versions 3/5 and metadata/cache versions 6/7. The output parent directory must
-exist; replacing an existing file requires `--force`. The library equivalent is
-`w3edit::convert(data: &[u8], format: BundleFormat) -> Result<Vec<u8>, ConversionError>`.
+Texture caches are created from a JSON manifest referencing already cooked GPU
+texture data. w3edit takes care of compression, streaming headers, page indexes,
+mip offsets and checksums.
 
-Conversion changes container layouts, not cooked resources, scripts, or texture
-formats, and does not establish compatibility with the target game. Compressed
-payload bytes are preserved; fields absent from the target layout are lost
-(for example, legacy bundle timestamps and metadata burst sizes when upgrading).
-Downgrades that exceed legacy integer limits fail instead of truncating values.
-Even same-target bundle conversion rebuilds the layout.
+Each chunk file contains uncompressed cooked GPU data without a DDS or PNG header,
+ordered from the largest mip to the smallest. The last chunk can contain multiple
+small mips. The descriptor and hash have to match the cooked texture resource;
+copy `name`, `hash`, dimensions, mip and slice counts, alignment, and texture type
+fields from the tooling that produced that resource. Do not guess or reuse a
+descriptor from another texture.
 
-Converting metadata alone preserves its recorded bundle offsets; it does not
-convert or reindex the referenced bundles. After converting bundles, regenerate
-their metadata, for example:
+<details>
+<summary>Notes</summary>
+
+- <sup>Chunk paths are resolved relative to the manifest. Absolute paths are accepted as well.</sup>
+- <sup>Each texture needs between 1 and 256 chunks, and no more chunks than mips.</sup>
+- <sup>Texture names have to be unique, relative and ISO-8859-1 encodable.
+Dimensions and slice counts have to be nonzero.</sup>
+- <sup>`is_cube`, `unk1` and `time_stamp` are optional and default to zero.
+Unknown fields are rejected.</sup>
+
+</details>
+
+### Merging
+
+When two mods supply the same file, choose which version should win. Inputs are
+ordered from highest to lowest priority; the first mod wins unless a per-file
+choice overrides it. For a full merged copy of their content:
 
 ```sh
-w3edit metadata create remastered/ remastered/metadata.store --format remastered --force
+w3edit merge \
+  "$W3_DIR/mods/modHighPriority" \
+  "$W3_DIR/mods/modLowPriority" \
+  --output build/modMerged \
+  --format remastered
 ```
 
-As with all metadata creation, this does not reconstruct resource-specific hashes
-or buffer information. To preserve those fields for a single-bundle mod, use
-`merge` with one input directory and an explicit `--format` instead.
+Inputs may be mod roots with a `content/` directory, or content directories
+directly. The output above is a mod root with files under `build/modMerged/content/`.
+Bundled files are rebuilt into `blob0.bundle` and `metadata.store` with
+fresh offsets and the winning files' metadata. All indexed bundles and additional
+`.bundle` files under the content directory are included. Texture caches are
+rebuilt by texture name, and loose files (including scripts) remain loose.
+Script-only mods and bundles without an index are supported.
 
-Create containers with an explicit target (the default is `legacy`):
+To create only an override layer for conflicting paths, leaving unique files in
+their original mods:
 
 ```sh
-mkdir -p output
-w3edit bundle pack cooked/ output/blob0.bundle --format remastered --compression zlib
-w3edit metadata create output/ output/metadata.store --format remastered
-w3edit texture create textures.json output/texture.cache --format remastered
+w3edit merge \
+  "$W3_DIR/mods/modHighPriority" \
+  "$W3_DIR/mods/modLowPriority" \
+  --output build/modConflictOverrides \
+  --conflicts-only \
+  --prefer 'scripts/game/player.ws=2' \
+  --format remastered
 ```
 
-The output parent directory must already exist for these creation commands.
-Packing recursively includes regular files in sorted order, stores paths relative
-to the input directory with backslash separators, and rejects symlinks and names
-outside ISO-8859-1. Stored names must fit in 255 bytes. Supported encoders are
-`none`, `zlib` (the default), `snappy`, `lz4`, and `lz4hc`. Packing compresses files;
-it does not convert legacy cooked assets to remastered assets or vice versa.
-Keep the output bundle outside the input tree to avoid packing an earlier output.
+`--prefer PATH=INPUT` picks a specific file from a numbered input (starting at 1),
+overriding the default order for that path only. Repeat it for other files or
+textures. Paths are relative to `content/` for loose files, or depot paths for
+bundled files and textures. Unknown paths, invalid input numbers, and duplicate
+choices are rejected before writing.
 
-Metadata creation recursively indexes `.bundle` files using their actual on-disk
-offsets without rewriting them. Every bundle must match the selected target;
-mixed-format input is rejected. It builds an index from bundle records, not from
-cooked resource internals: resource-specific hashes and buffer information are
-not reconstructed.
+A conflict means the same path occurs in at least two input mods, even when its
+bytes are identical. Repeated entries within one mod do not count. Path matching
+ignores ASCII case and treats `/` and `\` as equivalent. Bundled files, cached
+textures, and loose files are selected independently within their own groups.
 
-`texture create` reads a JSON manifest. Relative chunk paths are resolved against
-the manifest's directory; absolute chunk paths are also accepted. Each file
-contains uncompressed, already-cooked GPU data, not a PNG or DDS header.
-Chunks run from largest mip to smallest; the final chunk may hold several small
-mips. The descriptor and texture hash must match the cooked texture resource:
+Install `modConflictOverrides` under the game's `mods/` directory and give it
+higher priority than **all source mods** in your mod manager or `mods.settings`.
+Keep the originals enabled: conflict-only output does not contain their unique
+files. For a full merge, the output replaces the source mods' content; preserve
+any required DLC, settings, or installation steps outside that content yourself.
+The tool does not change game load order or modify its inputs.
 
-```json
-{
-  "textures": [{
-    "name": "textures\\example.xbm",
-    "hash": 894555473,
-    "width": 2048,
-    "height": 2048,
-    "mipcount": 12,
-    "slice_count": 1,
-    "base_alignment": 16,
-    "type1": 7,
-    "type2": 4,
-    "chunks": ["example-base.bin", "example-remaining-mips.bin"]
-  }]
-}
-```
+<details>
+<summary>Notes</summary>
 
-Optional `is_cube`, `unk1`, and `time_stamp` fields default to zero. The writer
-generates compression, streaming headers, page indexes, mip offsets, and checksums.
-Unknown manifest fields are rejected. Texture names must be unique, relative,
-ISO-8859-1 paths; dimensions and slice counts must be nonzero. Each texture needs
-1 to 256 chunks, with no more chunks than its mip count. The example descriptor
-is illustrative; it does not supply usable texture data or determine the correct
-format bytes and hash for another resource.
+- <sup>Merging picks whole files. It does not combine edits within scripts, XML,
+or cooked assets. Use a script/text merger when both mods' edits are needed.</sup>
+- <sup>Only `content/` is read when passing a mod root; files outside it are not
+included. Other cache formats are treated as opaque loose files and are not combined.</sup>
+- <sup>`--conflicts-only` requires a new or empty output `content/` directory, even
+with `--force`, to avoid retaining stale files. No conflicts produce a mod root
+with an empty `content/`. Empty bundle/metadata pairs and empty conflict-only caches are omitted.</sup>
+- <sup>Output must not overlap any input directory. Existing outputs are protected
+unless `--force` is used; this does not bypass the conflict-only empty-directory rule.</sup>
+- <sup>Files without source metadata use bundle-derived fields. Without `--format`,
+bundle and metadata output use the newest input bundle format.</sup>
+- <sup>Without `--format`, the texture cache format is selected independently of the
+bundle and metadata format. An explicit `--format` applies to all three, but
+doesn't convert cooked assets.</sup>
+- <sup>`--bundle-name` changes the name of the output bundle. It has to be a single
+ISO-8859-1 filename not ending in a dot or space, and can't be `metadata.store`
+or `texture.cache`.</sup>
 
-Merge container directories into one output set with rebuilt metadata offsets and
-cross-references. Each input directory must directly contain `blob0.bundle` and
-`metadata.store`; `texture.cache` is included when present. Point at the directory
-containing these files, not an enclosing mod directory. Additional bundles,
-scripts outside the bundle, and other companion files are not included.
-Inputs are ordered from highest to lowest priority, so the first mod wins
-filename conflicts. This selects whole files; it does not resolve script or
-asset-level conflicts. Texture caches are merged independently in the same
-priority order.
+</details>
+
+### Converting
+
+To target a mod's content at another game format, pass its root on both sides.
+Directory conversion uses the single-mod merge path: it combines its bundles,
+rebuilds metadata, preserves source metadata fields, converts its texture cache,
+and copies loose files:
 
 ```sh
-w3edit merge path/to/mod-a path/to/mod-b --output path/to/merged
-w3edit merge path/to/mod-a path/to/mod-b --output path/to/merged --format remastered
+w3edit convert \
+  "$W3_DIR/mods/modLegacy" \
+  build/modLegacy-remastered \
+  --format remastered
 ```
 
-Merge creates the output directory if needed. `--bundle-name NAME` changes the
-output bundle name (default: `blob0.bundle`), not the input bundle name. It must
-be a single ISO-8859-1 filename, must not end in a dot or space, and must not be
-`metadata.store` or `texture.cache` (case-insensitive). Without
-`--format`, the newest input bundle format determines the output bundle and
-metadata formats; the texture cache independently uses the newest input cache
-version. An explicit target sets all three output formats, but does not convert
-cooked assets.
+Converting upgrades or downgrades bundles, metadata indexes and texture caches
+between Legacy and Remastered layouts. The file type is detected from its contents.
 
-### Output Safety and Limits
+`convert` also accepts an individual container. Use an explicit output filename,
+or a mod root to write the default filename for that container type. For an
+explicit file, its output parent directory must already exist:
 
-Creation, conversion, extraction, and merge refuse to replace existing files unless `--force` is
-passed. Existing directories are not cleared, and failures can leave partial
-output. Use a fresh output directory, separate from your inputs, and keep backups.
+```sh
+mkdir -p build/converted/
+w3edit convert \
+  "$W3_DIR/mods/modExample/content/blob0.bundle" \
+  build/converted/blob0.bundle \
+  --format remastered
+```
 
-Bundle extraction rejects absolute and parent-traversal paths, but is not a
-filesystem sandbox: existing symlinks in the destination can redirect writes.
-Extract trusted bundles into a fresh directory without symlinks.
+Only the container layout is converted. Compressed payloads are carried over
+as they are, and cooked resources, scripts and textures are left untouched, so a
+converted container is not automatically compatible with the other game version.
 
-Use `w3edit --help` or command-specific help such as `w3edit bundle pack --help`
-for arguments and options.
+An individually converted `metadata.store` keeps its recorded bundle offsets.
+After converting individual bundles, recreate their metadata with `metadata create`.
+Directory conversion does this rebuilding automatically.
 
-The CLI loads containers into memory rather than streaming them. Merging holds
-inputs and serialized outputs in memory, so allow substantially more memory than
-the size of a single archive. Individual bundle item sizes, both compressed and
-uncompressed, remain limited to `u32` (less than 4 GiB), even in version 5.
+<details>
+<summary>Notes</summary>
+
+- <sup>Fields that don't exist in the target layout are dropped, such as legacy
+bundle timestamps and metadata burst sizes when upgrading.</sup>
+- <sup>Downgrading fails when values exceed the legacy limits instead of truncating them.</sup>
+- <sup>Bundles are always rebuilt, even when converting to the same format.</sup>
+
+</details>
+
+### Limitations
+
+w3edit loads containers into memory instead of streaming them, and merging keeps
+both the inputs and the merged output in memory. Individual bundle items are
+limited to less than 4 GiB, also in version 5 bundles.
 
 ## Library
 
-The library is exported as `w3edit`. Disable CLI dependencies with
-`default-features = false` in your Cargo dependency declaration; from a checkout,
-use `cargo build --lib --no-default-features`.
+```toml
+[dependencies]
+w3edit = { git = "https://github.com/Systemcluster/w3edit.git", default-features = false }
+```
 
-This example serializes a bundle, its metadata, and an empty texture cache in
-memory. The payload is a placeholder, not a cooked game asset:
+w3edit can be used as a library with the same functionality as the CLI.
+Disabling the default features removes the CLI dependencies.
 
 ```rust
 use w3edit::{Bundle, BundleCompression, BundleFormat, BundleItem, Metadata, TextureCache};
@@ -275,38 +356,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Use `Metadata::from_bundle_files` when indexing parsed files that will not be
-rewritten, and `TextureCache::insert` to add descriptors and cooked texture chunks.
-`merge_mods_for_format` selects all three output formats explicitly;
-`merge_mods` retains automatic format selection. Use these end-to-end merge APIs
-when the output metadata must reference a newly serialized merged bundle;
-independent `Bundle::merge` and `Metadata::merge` calls do not recompute those
-cross-references together.
+This creates a bundle with a placeholder payload, its metadata and an empty
+texture cache in memory. Other entry points include:
 
-The bundle API exposes 64-bit item offsets and `compute_offsets_u64()` for large
-version-5 bundles. `compute_offsets()` panics if an offset exceeds `u32`.
-Metadata entry offsets and bundle sizes are `u64`; legacy serialization rejects
-overflow instead of truncating. Prefer `Bundle::try_write()` and
-`Metadata::try_write()` for fallible serialization; their `write()` wrappers panic
-on serialization errors.
+- `merge_mods` and `merge_mods_for_format` merge complete mods with automatic or
+  explicit format selection. `Bundle::merge` and `Metadata::merge` on their own
+  don't update the cross-references between each other.
+- `merge_mods_with_options` accepts `MergeOptions` with `conflicts_only`, optional
+  `format`, and `preferred_sources` mapping depot paths to **zero-based** mod
+  indices. The library operates on containers; loose-file handling is in the CLI.
+- `Metadata::from_bundle_files` indexes parsed bundles that won't be rewritten.
+- `TextureCache::insert` adds texture descriptors and cooked texture chunks.
+- `convert` converts a container between formats.
+
+<details>
+<summary>Notes</summary>
+
+- <sup>Bundle item offsets are 64-bit. `compute_offsets()` panics when an offset
+exceeds `u32`, use `compute_offsets_u64()` for large version 5 bundles.</sup>
+- <sup>`write()` panics on serialization errors, such as values exceeding the legacy
+limits. Use `try_write()` to handle them instead.</sup>
+
+</details>
 
 ## Testing
-
-Run tests from a repository checkout, including the fixtures under `test/assets`:
 
 ```sh
 cargo test
 cargo test --no-default-features
 ```
 
-The suite covers creation, parsing, serialization, conversion, merging, and CLI workflows,
-using legacy fixtures and synthetic legacy/remastered cases. CLI tests run only
-with the `cli` feature enabled (the default). Tests and fixtures are not included
-in the Cargo publication package.
+The tests cover parsing, creating, converting and merging all supported containers
+as well as the CLI, using the fixtures in [`test/assets`](./test/assets) and generated
+Legacy and Remastered data.
 
-Three installed-game tests are ignored by default. To run them, point `W3_GAME_DIR`
-at a local Remastered installation root containing `content/metadata.store` and
-`content/content0/texture.cache`:
+Additional tests against an installed copy of the game are ignored by default.
+To run them, set `W3_GAME_DIR` to a Remastered installation:
 
 ```sh
 W3_GAME_DIR='/path/to/The Witcher 3' cargo test --test bundle installed_remastered_bundles -- --ignored --nocapture
@@ -314,13 +399,9 @@ W3_GAME_DIR='/path/to/The Witcher 3' cargo test --test metadata installed_remast
 W3_GAME_DIR='/path/to/The Witcher 3' cargo test --test texture_cache installed_remastered_texture_creation -- --ignored
 ```
 
-These tests read the installation without modifying it. The bundle test recursively
-memory-maps `.bundle` files, checks entry ranges, samples each codec per bundle,
-and decompresses and round-trips bundles smaller than 1 MB. Do not modify or update
-the installation while it runs. The metadata test checks a byte-identical version-7
-round-trip and the presence of 64-bit values. The texture test rebuilds the first
-two cached textures and compares decompressed data without reading the full cache.
-These checks do not establish in-game acceptance of generated containers.
+These tests only read the game files, but they shouldn't be modified or updated
+while the tests are running. They check all installed bundles, round-trip the
+metadata index and rebuild a sample of cached textures.
 
 ## License
 

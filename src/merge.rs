@@ -8,8 +8,8 @@
 //! new page layout. [`merge_mods`] closes that gap by re-computing every
 //! item's page-aligned offset and emitting fresh outputs.
 
-use std::collections::HashMap;
-use std::ffi::CStr;
+use std::collections::{HashMap, HashSet};
+use std::ffi::{CStr, CString};
 
 use crate::build::{PendingBundle, PendingEntry, PendingFile, build_metadata};
 use crate::bundle::{Bundle, BundleFormat, BundleItem};
@@ -68,13 +68,121 @@ pub struct MergedMod<'data> {
     pub texture_cache: Option<TextureCache>,
 }
 
+/// Whole-file conflict resolution for a list of mods in priority order.
+#[derive(Debug, Default, Clone)]
+pub struct MergeOptions {
+    /// Keep only paths supplied by at least two distinct input mods.
+    pub conflicts_only:    bool,
+    /// Override automatic output container format selection.
+    pub format:            Option<BundleFormat>,
+    /// Per-path winning mod indices (zero-based). Paths are ASCII case-insensitive
+    /// and treat slash and backslash as equivalent.
+    pub preferred_sources: HashMap<CString, usize>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum MergeError {
+    #[error("preferred mod index {source_index} does not supply path {path}")]
+    InvalidPreference { path: String, source_index: usize },
+    #[error("multiple preferences for path {0}")]
+    DuplicatePreference(String),
+    #[error(transparent)]
+    Metadata(#[from] MetadataError),
+}
+
+struct Selection {
+    source_index: usize,
+    providers:    HashSet<usize>,
+    name:         CString,
+}
+
+fn path_key(name: &CStr) -> Vec<u8> {
+    name.to_bytes()
+        .iter()
+        .map(|byte| {
+            if *byte == b'/' {
+                b'\\'
+            } else {
+                byte.to_ascii_lowercase()
+            }
+        })
+        .collect()
+}
+
+fn select_paths<'name>(
+    paths: impl Iterator<Item = (usize, &'name CStr)>,
+    preferences: &HashMap<Vec<u8>, usize>,
+) -> HashMap<Vec<u8>, Selection> {
+    let mut selections = HashMap::<Vec<u8>, Selection>::new();
+    for (source_index, name) in paths {
+        let key = path_key(name);
+        let preferred = preferences.get(&key) == Some(&source_index);
+        let selection = selections.entry(key).or_insert_with(|| Selection {
+            source_index,
+            providers: HashSet::new(),
+            name: name.to_owned(),
+        });
+        if selection.providers.insert(source_index) && preferred {
+            selection.source_index = source_index;
+            selection.name = name.to_owned();
+        }
+    }
+    selections
+}
+
+fn selected(selections: &HashMap<Vec<u8>, Selection>, source_index: usize, name: &CStr, conflicts_only: bool) -> bool {
+    selections.get(&path_key(name)).is_some_and(|selection| {
+        selection.source_index == source_index
+            && selection.name.as_c_str() == name
+            && (!conflicts_only || selection.providers.len() > 1)
+    })
+}
+
+/// Resolve whole-file conflicts before rebuilding output containers and metadata.
+/// Defaults to first-wins; per-path choices override that order. Conflict-only
+/// output is an override layer and requires the original mods to remain installed.
+/// Bundled paths and cached textures are selected independently.
+pub fn merge_mods_with_options<'data>(
+    mods: &[ModInput<'_, 'data>],
+    output_bundle_name: &CStr,
+    options: &MergeOptions,
+) -> Result<MergedMod<'data>, MergeError> {
+    let mut preferences = HashMap::new();
+    for (name, &source_index) in &options.preferred_sources {
+        let key = path_key(name);
+        let Some(source) = mods.get(source_index) else {
+            return Err(MergeError::InvalidPreference {
+                path: name.to_string_lossy().into_owned(),
+                source_index,
+            });
+        };
+        if !source.bundle.items().iter().any(|item| path_key(item.name()) == key)
+            && !source
+                .texture_cache
+                .is_some_and(|cache| cache.entries.iter().any(|(name, _)| path_key(name) == key))
+        {
+            return Err(MergeError::InvalidPreference {
+                path: name.to_string_lossy().into_owned(),
+                source_index,
+            });
+        }
+        if preferences.insert(key, source_index).is_some() {
+            return Err(MergeError::DuplicatePreference(name.to_string_lossy().into_owned()));
+        }
+    }
+    let merged = merge_mods_inner(mods, output_bundle_name, options, &preferences);
+    merged.metadata.try_write()?;
+    Ok(merged)
+}
+
 /// Merge N mods into a single output set, including `texture.cache` when any
 /// source supplies one.
 ///
 /// Priority is insertion order — `mods[0]` is the highest-priority mod.
 /// Behavior:
 ///
-/// - Bundles are merged via [`Bundle::merge`] (first-wins by filename).
+/// - Bundle paths are selected first-wins, ignoring ASCII case and treating
+///   slash and backslash as equivalent.
 /// - The resulting bundle is used to compute the final page-aligned byte
 ///   offset for every retained item.
 /// - The output metadata is built from scratch to describe **only** the
@@ -85,18 +193,18 @@ pub struct MergedMod<'data> {
 ///   retained item pointing at its fresh offset, and rebuilt string table +
 ///   directory tree.
 /// - For every item, per-file fields (`path_hash`, `size_in_memory`,
-///   `compression_type`, buffer, hash) are inherited from the first source
-///   metadata that has that file. Items without a matching metadata record
+///   `compression_type`, buffer, hash) are inherited from the mod that supplies
+///   the winning bundle item. Items without a matching metadata record
 ///   ("orphan" items) fall back to the fields derivable from the bundle TOC.
 /// - Texture caches are merged independently with the same first-wins mod
 ///   priority; missing caches are skipped, and the output cache is `None` when
 ///   no source supplies one.
 ///
-/// The returned bundle is exactly what [`Bundle::merge`] produced (still
-/// requires [`Bundle::write`](crate::bundle::Bundle::write) to serialize).
+/// The returned bundle retains the winning items' compressed bytes and still
+/// requires [`Bundle::write`](crate::bundle::Bundle::write) to serialize.
 /// The returned metadata is self-consistent and can be written immediately.
 pub fn merge_mods<'data>(mods: &[ModInput<'_, 'data>], output_bundle_name: &CStr) -> MergedMod<'data> {
-    merge_mods_inner(mods, output_bundle_name, None)
+    merge_mods_inner(mods, output_bundle_name, &MergeOptions::default(), &HashMap::new())
 }
 
 /// Merge into an explicit target format, rejecting legacy metadata overflow.
@@ -106,7 +214,11 @@ pub fn merge_mods_for_format<'data>(
     output_bundle_name: &CStr,
     format: BundleFormat,
 ) -> Result<MergedMod<'data>, MetadataError> {
-    let merged = merge_mods_inner(mods, output_bundle_name, Some(format));
+    let options = MergeOptions {
+        format: Some(format),
+        ..MergeOptions::default()
+    };
+    let merged = merge_mods_inner(mods, output_bundle_name, &options, &HashMap::new());
     merged.metadata.try_write()?;
     Ok(merged)
 }
@@ -114,10 +226,41 @@ pub fn merge_mods_for_format<'data>(
 fn merge_mods_inner<'data>(
     mods: &[ModInput<'_, 'data>],
     output_bundle_name: &CStr,
-    format: Option<BundleFormat>,
+    options: &MergeOptions,
+    preferences: &HashMap<Vec<u8>, usize>,
 ) -> MergedMod<'data> {
-    let texture_sources: Vec<&TextureCache> = mods.iter().filter_map(|m| m.texture_cache).collect();
-    let mut texture_cache = (!texture_sources.is_empty()).then(|| TextureCache::merge(&texture_sources));
+    let format = options.format;
+    let bundle_selections = select_paths(
+        mods.iter()
+            .enumerate()
+            .flat_map(|(source_index, input)| input.bundle.items().iter().map(move |item| (source_index, item.name()))),
+        preferences,
+    );
+    let texture_selections = select_paths(
+        mods.iter().enumerate().flat_map(|(source_index, input)| {
+            input.texture_cache.into_iter().flat_map(move |cache| {
+                cache
+                    .entries
+                    .iter()
+                    .map(move |(name, _)| (source_index, name.as_c_str()))
+            })
+        }),
+        preferences,
+    );
+    let texture_mods: Vec<_> = mods
+        .iter()
+        .enumerate()
+        .filter_map(|(index, input)| input.texture_cache.map(|cache| (index, cache)))
+        .collect();
+    let texture_sources: Vec<_> = texture_mods.iter().map(|(_, cache)| *cache).collect();
+    let mut texture_cache = (!texture_sources.is_empty()).then(|| {
+        TextureCache::merge_selected(&texture_sources, |index, name| {
+            selected(&texture_selections, texture_mods[index].0, name, options.conflicts_only)
+        })
+    });
+    if options.conflicts_only && texture_cache.as_ref().is_some_and(|cache| cache.entries.is_empty()) {
+        texture_cache = None;
+    }
     if let (Some(format), Some(cache)) = (format, &mut texture_cache) {
         cache.version = if format == BundleFormat::Legacy { 6 } else { 7 };
         for (_, entry) in &mut cache.entries {
@@ -128,7 +271,9 @@ fn merge_mods_inner<'data>(
 
     // 1. Merge bundles and compute final page-aligned offsets.
     let bundles: Vec<&Bundle<'data>> = mods.iter().map(|m| m.bundle).collect();
-    let mut merged_bundle = Bundle::merge(&bundles);
+    let mut merged_bundle = Bundle::merge_selected(&bundles, |index, name| {
+        selected(&bundle_selections, index, name, options.conflicts_only)
+    });
     if let Some(format) = format {
         merged_bundle = Bundle::from_items(format, merged_bundle.items().to_vec());
     }
@@ -156,8 +301,13 @@ fn merge_mods_inner<'data>(
     for (i, item) in merged_bundle.items().iter().enumerate() {
         let name = item.name().to_owned();
         let name_bytes = name.as_bytes();
-        let fields = metadata_fields_for(mods, &source_hash_lookups, name_bytes)
-            .unwrap_or_else(|| FileFields::from_bundle_item(item));
+        let source_index = bundle_selections[&path_key(item.name())].source_index;
+        let fields = metadata_fields_for(
+            mods[source_index].metadata,
+            &source_hash_lookups[source_index],
+            name_bytes,
+        )
+        .unwrap_or_else(|| FileFields::from_bundle_item(item));
 
         files.push(PendingFile {
             path:             name,
@@ -194,20 +344,14 @@ fn merge_mods_inner<'data>(
     }
 }
 
-fn metadata_fields_for(
-    mods: &[ModInput<'_, '_>],
-    hash_lookups: &[HashMap<i64, i64>],
-    name: &[u8],
-) -> Option<FileFields> {
-    mods.iter().enumerate().find_map(|(source_index, input)| {
-        let file_id = input.metadata.find_file_id_by_name(name)?;
-        let info = input.metadata.file_infos[file_id].1;
-        Some(FileFields {
-            path_hash:        info.path_hash,
-            size_in_memory:   info.size_in_memory,
-            compression_type: info.compression_type,
-            buffer_size:      input.metadata.buffer_size_of(&info),
-            hash:             hash_lookups[source_index].get(&(file_id as i64)).copied(),
-        })
+fn metadata_fields_for(metadata: &Metadata, hash_lookup: &HashMap<i64, i64>, name: &[u8]) -> Option<FileFields> {
+    let file_id = metadata.find_file_id_by_name(name)?;
+    let info = metadata.file_infos[file_id].1;
+    Some(FileFields {
+        path_hash:        info.path_hash,
+        size_in_memory:   info.size_in_memory,
+        compression_type: info.compression_type,
+        buffer_size:      metadata.buffer_size_of(&info),
+        hash:             hash_lookup.get(&(file_id as i64)).copied(),
     })
 }
